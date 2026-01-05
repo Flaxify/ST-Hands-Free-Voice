@@ -39,13 +39,9 @@ The final structure should look like:
 
 ```
 
-SillyTavern/
-└── data/
-  └── default-user/
-    └── extensions/
-      └── Extension-Mic-Toggle/
-        ├── index.js
-        ├── manifest.json
+SillyTavern/data/default-user/extensions/Extension-Mic-Toggle/
+├── index.js
+├── manifest.json
 
 ```
 
