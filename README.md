@@ -1,5 +1,3 @@
-```md
-
 # ST Hands-Free Voice
 
 A **SillyTavern extension** that enables natural, hands-free voice interaction by coordinating **TTS ↔ STT sequencing** with **silence detection**.
