@@ -52,4 +52,3 @@ SillyTavern/data/default-user/extensions/Extension-Mic-Toggle/
 4. Restart SillyTavern (or reload the UI).
 
 The extension will be automatically detected.
-```
