@@ -1,5 +1,3 @@
-## 🔧 Updated README.md — Installation (corrected)
-
 ```md
 ## Installation
 
