@@ -53,5 +53,3 @@ SillyTavern/data/default-user/extensions/Extension-Mic-Toggle/
 
 The extension will be automatically detected.
 ```
-
-
