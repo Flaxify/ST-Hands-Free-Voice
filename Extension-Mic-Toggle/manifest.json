@@ -1,0 +1,9 @@
+{
+    "name": "Mic Toggle (TTS/STT)",
+    "display_name": "Mic Toggle (TTS/STT)",
+    "description": "Toggles microphone off during TTS playback.",
+    "version": "1.0.0",
+    "author": "Andy",
+    "entrypoint": "index.js",
+    "js": ["index.js"]
+}
