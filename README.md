@@ -29,7 +29,7 @@ The extension is **opt-in, safe, and fully reversible**.
 
 ```
 
-3. Copy the folder into:
+3. Copy the folder Extension-Mic-Toggle into:
 
 ```
 
