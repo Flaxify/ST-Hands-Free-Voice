@@ -1,10 +1,9 @@
 {
     "display_name": "Hands-Free Voice",
     "version": "2.0.0",
-    "author": "Flaxify (fork)",
+    "author": "Flaxify",
     "description": "Fully automatic TTS → Listen → Whisper → Auto-continue loop. Hands-free roleplay.",
     "js": "index.js",
-    "author": "Flaxify",
     "homePage": "https://github.com/Flaxify/ST-Hands-Free-Voice",
     "minimum_client_version": "1.17.0",
     "hooks": {
