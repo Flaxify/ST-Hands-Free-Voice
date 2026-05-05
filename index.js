@@ -2,11 +2,33 @@ import { eventSource, event_types } from '../../../../script.js';
 
 const MODULE_NAME = "HandsFreeVoice";
 
+const PROVIDERS = {
+    openrouter: {
+        label: "OpenRouter",
+        endpoint: "https://openrouter.ai/api/v1",
+        defaultModel: "openai/whisper-large-v3-turbo",
+        format: "json_base64"
+    },
+    groq: {
+        label: "Groq",
+        endpoint: "https://api.groq.com/openai/v1",
+        defaultModel: "whisper-large-v3-turbo",
+        format: "multipart"
+    },
+    local: {
+        label: "Local / Custom",
+        endpoint: "",
+        defaultModel: "whisper-1",
+        format: "multipart"
+    }
+};
+
 const defaultSettings = Object.freeze({
     enabled: false,
-    endpoint: "https://openrouter.ai/api/v1",
+    provider: "openrouter",
     api_key: "",
     model: "openai/whisper-large-v3-turbo",
+    custom_endpoint: "",
     delay: 5
 });
 
@@ -42,8 +64,8 @@ function hookAudioElement() {
         }
     });
 
-    // An audio segment ended — start debounce timer
-    // If no new segment starts within 500 ms, TTS is truly done
+    // An audio segment ended — start debounce timer.
+    // If no new segment starts within 500 ms, TTS is truly done.
     audio.addEventListener('ended', () => {
         if (ttsEndTimer) clearTimeout(ttsEndTimer);
         ttsEndTimer = setTimeout(() => {
@@ -58,7 +80,21 @@ function hookAudioElement() {
     console.log("🔊 Hands-Free Voice: hooked into #tts_audio element");
 }
 
-console.log("🚀 Hands-Free Voice v2.4 loaded");
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function getEffectiveEndpoint() {
+    const provider = PROVIDERS[settings.provider];
+    if (!provider) return settings.custom_endpoint || '';
+    return settings.provider === 'local'
+        ? (settings.custom_endpoint || '').replace(/\/$/, '')
+        : provider.endpoint;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────
+console.log("🚀 Hands-Free Voice v2.5 loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -71,6 +107,15 @@ jQuery(() => {
         }
         settings = context.extensionSettings[MODULE_NAME];
 
+        // Migrate old "endpoint" field → provider
+        if (settings.endpoint !== undefined && settings.provider === undefined) {
+            const ep = settings.endpoint || '';
+            if (ep.includes('openrouter.ai')) settings.provider = 'openrouter';
+            else if (ep.includes('groq.com'))  settings.provider = 'groq';
+            else { settings.provider = 'local'; settings.custom_endpoint = ep; }
+            delete settings.endpoint;
+        }
+
         Object.keys(defaultSettings).forEach(key => {
             if (settings[key] === undefined) settings[key] = defaultSettings[key];
         });
@@ -78,14 +123,20 @@ jQuery(() => {
         addSettingsPanel();
         console.log("✅ Settings panel added");
 
-        // Hook into the real audio element for proper playback-end detection
         hookAudioElement();
 
-        console.log("🎤 Hands-Free Voice ready");
+        console.log("🎤 Hands-Free Voice v2.5 ready");
     });
 });
 
+// ─────────────────────────────────────────────────────────────
+// Settings UI
+// ─────────────────────────────────────────────────────────────
 function addSettingsPanel() {
+    const providerOptions = Object.entries(PROVIDERS)
+        .map(([key, p]) => `<option value="${key}">${p.label}</option>`)
+        .join('');
+
     const html = `
     <div class="handsfree-settings">
         <div class="inline-drawer">
@@ -96,9 +147,10 @@ function addSettingsPanel() {
             <div class="inline-drawer-content">
                 <label><input type="checkbox" id="hf_enabled"> Enable Hands-Free Mode</label>
 
-                <label>Provider Endpoint</label>
-                <input type="text" id="hf_endpoint" class="text_pole" placeholder="https://openrouter.ai/api/v1">
-                <small>OpenRouter: https://openrouter.ai/api/v1 &nbsp;|&nbsp; Groq: https://api.groq.com/openai/v1</small>
+                <label>API Provider</label>
+                <select id="hf_provider" class="text_pole">
+                    ${providerOptions}
+                </select>
 
                 <label>API Key</label>
                 <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-... / gsk_...">
@@ -106,7 +158,12 @@ function addSettingsPanel() {
                 <label>Whisper Model</label>
                 <input type="text" id="hf_model" class="text_pole" placeholder="openai/whisper-large-v3-turbo">
 
-                <label>Wait time before auto-continue (seconds)</label>
+                <div id="hf_custom_endpoint_row" style="display:none">
+                    <label>Custom Endpoint URL</label>
+                    <input type="text" id="hf_custom_endpoint" class="text_pole" placeholder="http://localhost:8080/v1">
+                </div>
+
+                <label>Silence timeout (seconds)</label>
                 <input type="number" id="hf_delay" class="text_pole" value="5" min="1" max="30">
                 <small>If you don't speak within this time, the character will continue automatically.</small>
             </div>
@@ -125,8 +182,15 @@ function bindSettingsUI() {
         context.saveSettingsDebounced();
     });
 
-    $('#hf_endpoint').val(settings.endpoint).on('input', function () {
-        settings.endpoint = this.value.trim();
+    $('#hf_provider').val(settings.provider).on('change', function () {
+        settings.provider = this.value;
+        const provider = PROVIDERS[settings.provider];
+        if (provider) {
+            // Auto-fill default model when provider changes
+            settings.model = provider.defaultModel;
+            $('#hf_model').val(settings.model);
+        }
+        updateCustomEndpointVisibility();
         context.saveSettingsDebounced();
     });
 
@@ -140,10 +204,22 @@ function bindSettingsUI() {
         context.saveSettingsDebounced();
     });
 
+    $('#hf_custom_endpoint').val(settings.custom_endpoint).on('input', function () {
+        settings.custom_endpoint = this.value.trim();
+        context.saveSettingsDebounced();
+    });
+
     $('#hf_delay').val(settings.delay).on('input', function () {
         settings.delay = parseFloat(this.value) || 5;
         context.saveSettingsDebounced();
     });
+
+    updateCustomEndpointVisibility();
+}
+
+function updateCustomEndpointVisibility() {
+    const isLocal = settings.provider === 'local';
+    $('#hf_custom_endpoint_row').toggle(isLocal);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -226,16 +302,61 @@ async function transcribeAndSend(audioBlob) {
         return;
     }
 
-    const formData = new FormData();
-    formData.append("file", audioBlob, "recording.webm");
-    formData.append("model", settings.model);
+    const endpoint = getEffectiveEndpoint();
+    if (!endpoint) {
+        console.error("❌ No endpoint configured. Set a custom endpoint URL in settings.");
+        stopListening();
+        return;
+    }
 
+    const providerFormat = PROVIDERS[settings.provider]?.format ?? 'multipart';
+
+    console.log(`🎙️ Transcribing via ${settings.provider} (${providerFormat}), blob: ${audioBlob.size} bytes`);
+
+    let res;
     try {
-        const res = await fetch(`${settings.endpoint}/audio/transcriptions`, {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${settings.api_key}` },
-            body: formData
-        });
+        if (providerFormat === 'json_base64') {
+            // ── OpenRouter: JSON body with base64-encoded audio ──────────────
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const bytes = new Uint8Array(arrayBuffer);
+            // btoa with large arrays needs chunked approach to avoid stack overflow
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            const base64 = btoa(binary);
+
+            // Derive format from MIME type
+            const mimeType = audioBlob.type || 'audio/webm';
+            const format = mimeType.includes('ogg')  ? 'ogg'
+                         : mimeType.includes('mp4')  ? 'mp4'
+                         : mimeType.includes('wav')  ? 'wav'
+                         : 'webm';
+
+            res = await fetch(`${endpoint}/audio/transcriptions`, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${settings.api_key}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    input_audio: { data: base64, format },
+                    model: settings.model
+                })
+            });
+        } else {
+            // ── Groq / Local / OpenAI-compatible: multipart FormData ─────────
+            const formData = new FormData();
+            formData.append("file", audioBlob, "recording.webm");
+            formData.append("model", settings.model);
+
+            res = await fetch(`${endpoint}/audio/transcriptions`, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${settings.api_key}` },
+                body: formData
+            });
+        }
 
         if (!res.ok) {
             const errorBody = await res.text();
@@ -245,11 +366,11 @@ async function transcribeAndSend(audioBlob) {
         }
 
         const data = await res.json();
-        if (data.text && data.text.trim()) {
-            const userText = data.text.trim();
-            console.log("📝 Whisper transcribed:", userText);
+        const transcribed = (data.text || data.transcript || '').trim();
+        if (transcribed) {
+            console.log("📝 Whisper transcribed:", transcribed);
             const context = SillyTavern.getContext();
-            await context.sendUserMessage(userText);
+            await context.sendUserMessage(transcribed);
         } else {
             console.log("🔇 No speech recognized in audio");
         }
@@ -264,5 +385,3 @@ async function autoContinue() {
     const context = SillyTavern.getContext();
     await context.generate('continue');
 }
-
-console.log("Hands-Free Voice v2.4 ready");
