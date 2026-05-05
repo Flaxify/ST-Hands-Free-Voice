@@ -1,11 +1,11 @@
 import { eventSource, event_types } from '../../../../script.js';
 
 const MODULE_NAME = "HandsFreeVoice";
-const SECRET_KEY_NAME = "api_key_handsfree_voice";
 
 const defaultSettings = Object.freeze({
     enabled: false,
     endpoint: "https://openrouter.ai/v1",
+    api_key: "",
     model: "openai/whisper-large-v3-turbo",
     delay: 5
 });
@@ -17,10 +17,10 @@ let recorder = null;
 let silenceTimer = null;
 let isListening = false;
 
-console.log("🚀 Hands-Free Voice v2.2 loaded (secure API key like TTS)");
+console.log("🚀 Hands-Free Voice v2.3 loaded (simple secure password field)");
 
 jQuery(() => {
-    eventSource.on(event_types.APP_READY, async () => {
+    eventSource.on(event_types.APP_READY, () => {
         console.log("✅ Hands-Free Voice: APP_READY → initializing");
 
         const context = SillyTavern.getContext();
@@ -35,8 +35,7 @@ jQuery(() => {
         });
 
         addSettingsPanel();
-        console.log("✅ Settings panel with green 🔑 button added");
-
+        console.log("✅ Settings panel added");
         eventSource.on(event_types.TTS_JOB_COMPLETE, onTTSComplete);
 
         console.log("🎤 Hands-Free Voice ready");
@@ -57,11 +56,8 @@ function addSettingsPanel() {
                 <label>Provider Endpoint</label>
                 <input type="text" id="hf_endpoint" class="text_pole" value="https://openrouter.ai/v1">
 
-                <label>API Key <span style="color:#0f0">(secure like TTS)</span></label>
-                <div class="flex-container" style="gap: 8px;">
-                    <input type="password" id="hf_api_key_display" class="text_pole" readonly placeholder="Click the green 🔑 button →">
-                    <button class="menu_button fa-solid fa-key" onclick="openHandsFreeKeyEditor()" title="Store API Key securely"></button>
-                </div>
+                <label>API Key (OpenRouter)</label>
+                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-...">
 
                 <label>Whisper Model</label>
                 <input type="text" id="hf_model" class="text_pole" value="openai/whisper-large-v3-turbo">
@@ -90,6 +86,11 @@ function bindSettingsUI() {
         context.saveSettingsDebounced();
     });
 
+    $('#hf_api_key').val(settings.api_key).on('input', function () {
+        settings.api_key = this.value.trim();
+        context.saveSettingsDebounced();
+    });
+
     $('#hf_model').val(settings.model).on('input', function () {
         settings.model = this.value.trim();
         context.saveSettingsDebounced();
@@ -101,24 +102,8 @@ function bindSettingsUI() {
     });
 }
 
-// Global function called by the green key button
-window.openHandsFreeKeyEditor = function () {
-    openKeyManagerDialog(SECRET_KEY_NAME);   // ← This is the correct function
-};
-
-// Get the active secure API key (works with the new secret system)
-async function getSecureApiKey() {
-    const context = SillyTavern.getContext();
-    await context.readSecretState();                 // refresh latest secrets
-    const secrets = context.secret_state || {};     // secret_state is populated by readSecretState
-    const keyData = secrets[SECRET_KEY_NAME];
-    if (!keyData || keyData.length === 0) return '';
-    const activeSecret = keyData.find(s => s.active) || keyData[0];
-    return activeSecret ? activeSecret.value : '';
-}
-
 // ─────────────────────────────────────────────────────────────
-// TTS → Listen → Whisper → Send / Auto-continue
+// Core logic (TTS complete → listen → transcribe → send)
 // ─────────────────────────────────────────────────────────────
 async function onTTSComplete() {
     if (!settings.enabled) return;
@@ -128,20 +113,73 @@ async function onTTSComplete() {
     if (silenceTimer) clearTimeout(silenceTimer);
     silenceTimer = setTimeout(() => {
         if (!isListening) return;
-        console.log("⏰ No speech – auto-continuing");
+        console.log("⏰ No speech detected – auto-continuing");
         autoContinue();
         stopListening();
     }, settings.delay * 1000);
 }
 
-async function startVoiceDetection() { /* unchanged – same as v2.1 */ }
-async function startRecording() { /* unchanged */ }
-function stopListening() { /* unchanged */ }
+async function startVoiceDetection() {
+    if (isListening) return;
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        isListening = true;
+        let speechDetected = false;
+
+        const checkLevel = () => {
+            if (!isListening) return;
+            analyser.getByteFrequencyData(dataArray);
+            const volume = dataArray.reduce((a, b) => a + b) / dataArray.length;
+            if (volume > 25 && !speechDetected) {
+                speechDetected = true;
+                console.log("🗣️ Speech detected – recording");
+                clearTimeout(silenceTimer);
+                startRecording();
+            }
+            requestAnimationFrame(checkLevel);
+        };
+        checkLevel();
+    } catch (err) {
+        console.error("❌ Mic access failed:", err);
+    }
+}
+
+async function startRecording() {
+    if (!mediaStream) return;
+    recorder = new MediaRecorder(mediaStream);
+    const chunks = [];
+
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        await transcribeAndSend(blob);
+    };
+
+    recorder.start();
+    setTimeout(() => {
+        if (recorder && recorder.state === "recording") recorder.stop();
+    }, 8000);
+}
+
+function stopListening() {
+    isListening = false;
+    if (recorder && recorder.state === "recording") recorder.stop();
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+    audioContext = null;
+    recorder = null;
+}
 
 async function transcribeAndSend(audioBlob) {
-    const apiKey = await getSecureApiKey();
-    if (!apiKey) {
-        console.error("❌ No API key set – click the green 🔑 button");
+    if (!settings.api_key) {
+        console.error("❌ No API key set in Hands-Free Voice settings");
         stopListening();
         return;
     }
@@ -153,7 +191,7 @@ async function transcribeAndSend(audioBlob) {
     try {
         const res = await fetch(`${settings.endpoint}/audio/transcriptions`, {
             method: "POST",
-            headers: { "Authorization": `Bearer ${apiKey}` },
+            headers: { "Authorization": `Bearer ${settings.api_key}` },
             body: formData
         });
 
@@ -163,6 +201,8 @@ async function transcribeAndSend(audioBlob) {
             console.log("📝 Whisper transcribed:", userText);
             const context = SillyTavern.getContext();
             await context.sendUserMessage(userText);
+        } else {
+            console.log("No speech recognized");
         }
     } catch (err) {
         console.error("❌ Whisper API error:", err);
@@ -176,7 +216,4 @@ async function autoContinue() {
     await context.generate('continue');
 }
 
-// Keep the remaining functions (startVoiceDetection, startRecording, stopListening) exactly as in v2.1
-// (copy them from the previous full version I gave you)
-
-console.log("Hands-Free Voice v2.2 (secure API key) ready");
+console.log("Hands-Free Voice v2.3 ready");
