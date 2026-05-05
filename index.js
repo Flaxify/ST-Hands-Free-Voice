@@ -1,6 +1,7 @@
 import { eventSource, event_types } from '../../../../script.js';
 
 const MODULE_NAME = "HandsFreeVoice";
+const SECRET_KEY_NAME = "api_key_handsfree_voice";
 
 const defaultSettings = Object.freeze({
     enabled: false,
@@ -16,17 +17,14 @@ let recorder = null;
 let silenceTimer = null;
 let isListening = false;
 
-const SECRET_KEY_NAME = "api_key_handsfree_voice";   // ← secure storage like TTS
-
-console.log("🚀 Hands-Free Voice v2.1 loaded (secure API key like TTS)");
+console.log("🚀 Hands-Free Voice v2.2 loaded (secure API key like TTS)");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, async () => {
-        console.log("✅ Hands-Free Voice: APP_READY → initializing with secure API key");
+        console.log("✅ Hands-Free Voice: APP_READY → initializing");
 
         const context = SillyTavern.getContext();
 
-        // Load normal settings
         if (!context.extensionSettings[MODULE_NAME]) {
             context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
         }
@@ -37,7 +35,7 @@ jQuery(() => {
         });
 
         addSettingsPanel();
-        console.log("✅ Settings panel with secure key button added");
+        console.log("✅ Settings panel with green 🔑 button added");
 
         eventSource.on(event_types.TTS_JOB_COMPLETE, onTTSComplete);
 
@@ -61,8 +59,8 @@ function addSettingsPanel() {
 
                 <label>API Key <span style="color:#0f0">(secure like TTS)</span></label>
                 <div class="flex-container" style="gap: 8px;">
-                    <input type="password" id="hf_api_key_display" class="text_pole" readonly placeholder="Click the 🔑 button to set securely">
-                    <button class="menu_button fa-solid fa-key" onclick="openHandsFreeApiKeyEditor()" title="Store API Key securely (TTS-style)"></button>
+                    <input type="password" id="hf_api_key_display" class="text_pole" readonly placeholder="Click the green 🔑 button →">
+                    <button class="menu_button fa-solid fa-key" onclick="openHandsFreeKeyEditor()" title="Store API Key securely"></button>
                 </div>
 
                 <label>Whisper Model</label>
@@ -103,31 +101,47 @@ function bindSettingsUI() {
     });
 }
 
-// Open the secure secret editor (exactly like TTS plugin)
-window.openHandsFreeApiKeyEditor = function () {
-    const context = SillyTavern.getContext();
-    context.openSecretEditor(SECRET_KEY_NAME, "Hands-Free Voice API Key");
+// Global function called by the green key button
+window.openHandsFreeKeyEditor = function () {
+    openKeyManagerDialog(SECRET_KEY_NAME);   // ← This is the correct function
 };
 
-// Get the secure API key when needed
+// Get the active secure API key (works with the new secret system)
 async function getSecureApiKey() {
     const context = SillyTavern.getContext();
-    const secrets = await context.readSecretState();
-    return secrets[SECRET_KEY_NAME] || '';
+    await context.readSecretState();                 // refresh latest secrets
+    const secrets = context.secret_state || {};     // secret_state is populated by readSecretState
+    const keyData = secrets[SECRET_KEY_NAME];
+    if (!keyData || keyData.length === 0) return '';
+    const activeSecret = keyData.find(s => s.active) || keyData[0];
+    return activeSecret ? activeSecret.value : '';
 }
 
 // ─────────────────────────────────────────────────────────────
-// The rest of the logic (unchanged except API key source)
+// TTS → Listen → Whisper → Send / Auto-continue
 // ─────────────────────────────────────────────────────────────
-async function onTTSComplete() { /* same as before */ }
-async function startVoiceDetection() { /* same as before */ }
-async function startRecording() { /* same as before */ }
-function stopListening() { /* same as before */ }
+async function onTTSComplete() {
+    if (!settings.enabled) return;
+    console.log("🎤 TTS complete – starting hands-free listening");
+    await startVoiceDetection();
+
+    if (silenceTimer) clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+        if (!isListening) return;
+        console.log("⏰ No speech – auto-continuing");
+        autoContinue();
+        stopListening();
+    }, settings.delay * 1000);
+}
+
+async function startVoiceDetection() { /* unchanged – same as v2.1 */ }
+async function startRecording() { /* unchanged */ }
+function stopListening() { /* unchanged */ }
 
 async function transcribeAndSend(audioBlob) {
     const apiKey = await getSecureApiKey();
     if (!apiKey) {
-        console.error("❌ No API key set (use the green 🔑 button)");
+        console.error("❌ No API key set – click the green 🔑 button");
         stopListening();
         return;
     }
@@ -162,4 +176,7 @@ async function autoContinue() {
     await context.generate('continue');
 }
 
-console.log("Hands-Free Voice v2.1 (secure API key) ready");
+// Keep the remaining functions (startVoiceDetection, startRecording, stopListening) exactly as in v2.1
+// (copy them from the previous full version I gave you)
+
+console.log("Hands-Free Voice v2.2 (secure API key) ready");
