@@ -4,7 +4,7 @@ const MODULE_NAME = "HandsFreeVoice";
 
 const defaultSettings = Object.freeze({
     enabled: false,
-    endpoint: "https://openrouter.ai/v1",
+    endpoint: "https://openrouter.ai/api/v1",
     api_key: "",
     model: "openai/whisper-large-v3-turbo",
     delay: 5
@@ -17,7 +17,48 @@ let recorder = null;
 let silenceTimer = null;
 let isListening = false;
 
-console.log("🚀 Hands-Free Voice v2.3 loaded (simple secure password field)");
+// ─────────────────────────────────────────────────────────────
+// TTS playback-end detection via ST's #tts_audio element
+// ─────────────────────────────────────────────────────────────
+let ttsEndTimer = null;
+
+/**
+ * Wait for ST's <audio id="tts_audio"> element to appear in the DOM,
+ * then attach ended/play listeners so we know when speech truly stops.
+ * ST appends this element to document.body during its TTS init.
+ */
+function hookAudioElement() {
+    const audio = document.getElementById('tts_audio');
+    if (!audio) {
+        setTimeout(hookAudioElement, 500);
+        return;
+    }
+
+    // A new audio segment started — cancel any pending "all done" timer
+    audio.addEventListener('play', () => {
+        if (ttsEndTimer) {
+            clearTimeout(ttsEndTimer);
+            ttsEndTimer = null;
+        }
+    });
+
+    // An audio segment ended — start debounce timer
+    // If no new segment starts within 500 ms, TTS is truly done
+    audio.addEventListener('ended', () => {
+        if (ttsEndTimer) clearTimeout(ttsEndTimer);
+        ttsEndTimer = setTimeout(() => {
+            ttsEndTimer = null;
+            if (settings.enabled && !isListening) {
+                console.log("🎤 TTS playback fully ended – starting hands-free listening");
+                onTTSPlaybackEnded();
+            }
+        }, 500);
+    });
+
+    console.log("🔊 Hands-Free Voice: hooked into #tts_audio element");
+}
+
+console.log("🚀 Hands-Free Voice v2.4 loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -36,7 +77,9 @@ jQuery(() => {
 
         addSettingsPanel();
         console.log("✅ Settings panel added");
-        eventSource.on(event_types.TTS_JOB_COMPLETE, onTTSComplete);
+
+        // Hook into the real audio element for proper playback-end detection
+        hookAudioElement();
 
         console.log("🎤 Hands-Free Voice ready");
     });
@@ -54,13 +97,14 @@ function addSettingsPanel() {
                 <label><input type="checkbox" id="hf_enabled"> Enable Hands-Free Mode</label>
 
                 <label>Provider Endpoint</label>
-                <input type="text" id="hf_endpoint" class="text_pole" value="https://openrouter.ai/v1">
+                <input type="text" id="hf_endpoint" class="text_pole" placeholder="https://openrouter.ai/api/v1">
+                <small>OpenRouter: https://openrouter.ai/api/v1 &nbsp;|&nbsp; Groq: https://api.groq.com/openai/v1</small>
 
-                <label>API Key (OpenRouter)</label>
-                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-...">
+                <label>API Key</label>
+                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-... / gsk_...">
 
                 <label>Whisper Model</label>
-                <input type="text" id="hf_model" class="text_pole" value="openai/whisper-large-v3-turbo">
+                <input type="text" id="hf_model" class="text_pole" placeholder="openai/whisper-large-v3-turbo">
 
                 <label>Wait time before auto-continue (seconds)</label>
                 <input type="number" id="hf_delay" class="text_pole" value="5" min="1" max="30">
@@ -103,11 +147,9 @@ function bindSettingsUI() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Core logic (TTS complete → listen → transcribe → send)
+// Core logic (TTS playback done → listen → transcribe → send)
 // ─────────────────────────────────────────────────────────────
-async function onTTSComplete() {
-    if (!settings.enabled) return;
-    console.log("🎤 TTS complete – starting hands-free listening");
+async function onTTSPlaybackEnded() {
     await startVoiceDetection();
 
     if (silenceTimer) clearTimeout(silenceTimer);
@@ -195,6 +237,13 @@ async function transcribeAndSend(audioBlob) {
             body: formData
         });
 
+        if (!res.ok) {
+            const errorBody = await res.text();
+            console.error(`❌ Whisper API error ${res.status}:`, errorBody);
+            stopListening();
+            return;
+        }
+
         const data = await res.json();
         if (data.text && data.text.trim()) {
             const userText = data.text.trim();
@@ -202,7 +251,7 @@ async function transcribeAndSend(audioBlob) {
             const context = SillyTavern.getContext();
             await context.sendUserMessage(userText);
         } else {
-            console.log("No speech recognized");
+            console.log("🔇 No speech recognized in audio");
         }
     } catch (err) {
         console.error("❌ Whisper API error:", err);
@@ -216,4 +265,4 @@ async function autoContinue() {
     await context.generate('continue');
 }
 
-console.log("Hands-Free Voice v2.3 ready");
+console.log("Hands-Free Voice v2.4 ready");
