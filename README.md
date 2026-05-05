@@ -1,5 +1,8 @@
 # ST Hands-Free Voice
 
+
+**FORKED BECAUE OF INCOMPATIBILITY TO v1.17.0**
+
 A **SillyTavern extension** that enables natural, hands-free voice interaction by coordinating **TTS ↔ STT sequencing** with **silence detection**.
 
 It solves common issues such as:
