@@ -1,315 +1,220 @@
-(() => {
-  const MIC_SELECTOR = "#microphone_button";
+const MODULE_NAME = "HandsFreeVoice";
 
-  // ---- Feature Toggle (persisted, OFF by default) ----
-  const EXT_KEY = "handsfree_seq_enabled";
+// Default settings
+const defaultSettings = Object.freeze({
+    enabled: false,
+    endpoint: "https://openrouter.ai/v1",
+    api_key: "",
+    model: "openai/whisper-large-v3-turbo",
+    delay: 5
+});
 
-  // ⬇️ DEFAULT = false if not yet set
-  let handsfreeEnabled = (localStorage.getItem(EXT_KEY) ?? "false") === "true";
+let settings = {};
+let mediaStream = null;
+let audioContext = null;
+let recorder = null;
+let silenceTimer = null;
+let isListening = false;
 
-  function setHandsfreeEnabled(v) {
-    handsfreeEnabled = !!v;
-    localStorage.setItem(EXT_KEY, handsfreeEnabled ? "true" : "false");
+async function onActivate() {
+    console.log("✅ Hands-Free Voice activated");
 
-    if (!handsfreeEnabled) {
-      try { clearTimers(); } catch {}
-      try { stopVad(); } catch {}
+    const { extensionSettings, saveSettingsDebounced, eventSource, event_types, renderExtensionTemplateAsync } = SillyTavern.getContext();
+
+    // Load / init settings
+    if (!extensionSettings[MODULE_NAME]) {
+        extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
     }
+    settings = extensionSettings[MODULE_NAME];
 
-    updateToggleUI();
-  }
-
-  function toggleHandsfree() {
-    setHandsfreeEnabled(!handsfreeEnabled);
-  }
-
-  // ---- Tunables ----
-  const RESUME_COOLDOWN_MS = 300;
-  const TTS_GAP_GRACE_MS = 2000;
-  const CLICK_VERIFY_MS = 120;
-  const MAX_RETRIES = 4;
-
-  // VAD / silence endpointing
-  const LEVEL_THRESHOLD = 0.028;
-  const MIN_SPEECH_MS = 350;
-  const SILENCE_MS_TO_STOP = 1100;
-  const POLL_MS = 50;
-
-  const DEBUG = true;
-  const log = (...a) => DEBUG && console.log("[SEQ]", ...a);
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  // ---- Mic state ----
-  function micBtn() {
-    return document.querySelector(MIC_SELECTOR);
-  }
-
-  function micIsRecording(btn) {
-    if (!btn) return false;
-
-    const cls = (btn.className || "").toLowerCase();
-    if (cls.includes("fa-microphone-slash")) return true;
-    if (cls.includes("fa-microphone") && !cls.includes("fa-microphone-slash")) return false;
-
-    const title = (btn.getAttribute("title") || "").toLowerCase();
-    if (title.includes("end and transcribe")) return true;
-    if (title.includes("click to speak")) return false;
-
-    return false;
-  }
-
-  async function enforceMic(shouldRecord) {
-    if (!handsfreeEnabled) return false;
-
-    const btn = micBtn();
-    if (!btn) return false;
-
-    for (let i = 1; i <= MAX_RETRIES; i++) {
-      if (micIsRecording(btn) === shouldRecord) return true;
-      btn.click();
-      await sleep(CLICK_VERIFY_MS);
-    }
-    return false;
-  }
-
-  // ---- UI Toggle Button ----
-  function ensureToggleButton() {
-    if (document.querySelector("#handsfree_toggle_btn")) return;
-
-    const mic = micBtn();
-    if (!mic) return;
-
-    const btn = document.createElement("button");
-    btn.id = "handsfree_toggle_btn";
-    btn.type = "button";
-    btn.title = "Toggle hands-free voice sequencing";
-    btn.style.marginLeft = "8px";
-    btn.style.padding = "2px 8px";
-    btn.style.borderRadius = "8px";
-    btn.style.border = "1px solid var(--SmartThemeBorderColor, #666)";
-    btn.style.background = "var(--SmartThemeBodyColor, transparent)";
-    btn.style.cursor = "pointer";
-    btn.style.fontSize = "12px";
-    btn.style.lineHeight = "18px";
-    btn.style.userSelect = "none";
-
-    btn.addEventListener("click", toggleHandsfree);
-
-    mic.parentElement?.appendChild(btn);
-    updateToggleUI();
-  }
-
-  function updateToggleUI() {
-    const btn = document.querySelector("#handsfree_toggle_btn");
-    if (!btn) return;
-
-    btn.textContent = handsfreeEnabled ? "HF:ON" : "HF:OFF";
-    btn.style.opacity = handsfreeEnabled ? "1" : "0.55";
-  }
-
-  // Optional hotkey: Ctrl+Shift+H
-  function installHotkey() {
-    if (window.__handsfree_hotkey_installed) return;
-    window.__handsfree_hotkey_installed = true;
-
-    window.addEventListener("keydown", (e) => {
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyH") {
-        toggleHandsfree();
-        e.preventDefault();
-      }
-    });
-  }
-
-  // ---- TTS sequencing ----
-  let ttsCount = 0;
-  let resumeTimer = null;
-  let gapTimer = null;
-
-  function clearTimers() {
-    if (resumeTimer) clearTimeout(resumeTimer);
-    if (gapTimer) clearTimeout(gapTimer);
-    resumeTimer = null;
-    gapTimer = null;
-  }
-
-  function ttsStart() {
-    if (!handsfreeEnabled) return;
-
-    ttsCount++;
-    clearTimers();
-    enforceMic(false);
-  }
-
-  function scheduleGapCheck() {
-    if (!handsfreeEnabled) return;
-
-    if (gapTimer) clearTimeout(gapTimer);
-
-    gapTimer = setTimeout(() => {
-      gapTimer = null;
-
-      if (ttsCount === 0) {
-        resumeTimer = setTimeout(() => {
-          if (handsfreeEnabled && ttsCount === 0) {
-            enforceMic(true);
-          }
-        }, RESUME_COOLDOWN_MS);
-      }
-    }, TTS_GAP_GRACE_MS);
-  }
-
-  function ttsEnd() {
-    if (!handsfreeEnabled) return;
-
-    ttsCount = Math.max(0, ttsCount - 1);
-    if (ttsCount === 0) scheduleGapCheck();
-  }
-
-  // ---- VAD endpointing ----
-  let audioCtx = null, analyser = null, source = null, stream = null, pollTimer = null;
-  let speechStartedAt = 0, lastLoudAt = 0;
-
-  function rms() {
-    const buf = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(buf);
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const v = (buf[i] - 128) / 128;
-      sum += v * v;
-    }
-    return Math.sqrt(sum / buf.length);
-  }
-
-  async function ensureVadRunning() {
-    if (!handsfreeEnabled || pollTimer) return;
-
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    // Ensure all keys exist
+    Object.keys(defaultSettings).forEach(key => {
+        if (settings[key] === undefined) settings[key] = defaultSettings[key];
     });
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 1024;
+    // Add settings panel
+    const html = await renderExtensionTemplateAsync("Hands-Free-Voice", "settings", {});
+    $('#extensions_settings2').append(html);
+    bindSettingsUI();
 
-    source = audioCtx.createMediaStreamSource(stream);
-    source.connect(analyser);
+    // Listen to TTS completion
+    eventSource.on(event_types.TTS_JOB_COMPLETE, onTTSComplete);
 
-    speechStartedAt = 0;
-    lastLoudAt = performance.now();
+    console.log("Hands-Free Voice ready – waiting for TTS to finish");
+}
 
-    pollTimer = setInterval(() => {
-      if (!handsfreeEnabled) return;
+function onDisable() {
+    console.log("Hands-Free Voice disabled");
+    stopListening();
+}
 
-      const btn = micBtn();
-      if (!btn || !micIsRecording(btn)) return;
-      if (ttsCount > 0 || gapTimer) return;
-
-      const level = rms();
-      const now = performance.now();
-
-      if (level >= LEVEL_THRESHOLD) {
-        if (!speechStartedAt) speechStartedAt = now;
-        lastLoudAt = now;
-      }
-
-      if (
-        speechStartedAt &&
-        now - speechStartedAt >= MIN_SPEECH_MS &&
-        now - lastLoudAt >= SILENCE_MS_TO_STOP
-      ) {
-        btn.click();
-        speechStartedAt = 0;
-        lastLoudAt = performance.now();
-      }
-    }, POLL_MS);
-  }
-
-  function stopVad() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
-
-    try { source?.disconnect(); } catch {}
-    try { analyser?.disconnect?.(); } catch {}
-    try { audioCtx?.close?.(); } catch {}
-    try { stream?.getTracks()?.forEach(t => t.stop()); } catch {}
-
-    source = analyser = audioCtx = stream = null;
-  }
-
-  function installMicObserver() {
-    const btn = micBtn();
-    if (!btn) return;
-
-    const obs = new MutationObserver(() => {
-      if (!handsfreeEnabled) {
-        stopVad();
-        return;
-      }
-      micIsRecording(btn) ? ensureVadRunning().catch(() => {}) : stopVad();
+function bindSettingsUI() {
+    $('#hf_enabled').prop('checked', settings.enabled).on('change', function () {
+        settings.enabled = this.checked;
+        saveSettingsDebounced();
     });
 
-    obs.observe(btn, { attributes: true, attributeFilter: ["class", "title", "aria-label"] });
+    $('#hf_endpoint').val(settings.endpoint).on('change', function () {
+        settings.endpoint = this.value.trim();
+        saveSettingsDebounced();
+    });
 
-    if (handsfreeEnabled && micIsRecording(btn)) ensureVadRunning().catch(() => {});
-  }
+    $('#hf_api_key').val(settings.api_key).on('change', function () {
+        settings.api_key = this.value.trim();
+        saveSettingsDebounced();
+    });
 
-  // ---- Native-safe TTS hook ----
-  function installTtsHook() {
-    const ss = window.speechSynthesis;
-    if (!ss?.speak) return;
+    $('#hf_model').val(settings.model).on('change', function () {
+        settings.model = this.value.trim();
+        saveSettingsDebounced();
+    });
 
-    if (!window.__st_nativeSpeak) {
-      window.__st_nativeSpeak = ss.speak.bind(ss);
-      window.__st_nativeCancel = ss.cancel?.bind(ss);
-    }
+    $('#hf_delay').val(settings.delay).on('change', function () {
+        settings.delay = parseFloat(this.value);
+        saveSettingsDebounced();
+    });
+}
 
-    if (window.__st_seq_installed_final) return;
-    window.__st_seq_installed_final = true;
+// ─────────────────────────────────────────────────────────────
+// TTS finished → start hands-free listening window
+// ─────────────────────────────────────────────────────────────
+async function onTTSComplete() {
+    if (!settings.enabled) return;
 
-    ss.speak = function (utterance) {
-      if (handsfreeEnabled) ttsStart();
+    console.log("🎤 TTS complete – starting hands-free listening window");
 
-      try {
-        const pe = utterance.onend;
-        const pr = utterance.onerror;
+    // Start listening immediately
+    await startVoiceDetection();
 
-        utterance.onend = e => {
-          if (handsfreeEnabled) ttsEnd();
-          pe?.call(utterance, e);
+    // Start the auto-continue timer
+    if (silenceTimer) clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+        if (!isListening) return;
+        console.log("⏰ No speech detected – auto-continuing character message");
+        autoContinue();
+        stopListening();
+    }, settings.delay * 1000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Voice detection + recording (simple but reliable VAD)
+// ─────────────────────────────────────────────────────────────
+async function startVoiceDetection() {
+    if (isListening) return;
+
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(mediaStream);
+
+        // Simple volume-based VAD
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+
+        const bufferLength = analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+
+        isListening = true;
+        let speechDetected = false;
+
+        const checkAudioLevel = () => {
+            if (!isListening) return;
+
+            analyser.getByteFrequencyData(dataArray);
+            const volume = dataArray.reduce((a, b) => a + b) / bufferLength;
+
+            if (volume > 25 && !speechDetected) {
+                speechDetected = true;
+                console.log("🗣️ Speech detected – starting recording");
+                clearTimeout(silenceTimer);
+                startRecording();
+            }
+
+            requestAnimationFrame(checkAudioLevel);
         };
-        utterance.onerror = e => {
-          if (handsfreeEnabled) ttsEnd();
-          pr?.call(utterance, e);
-        };
-      } catch {}
 
-      return window.__st_nativeSpeak(utterance);
+        checkAudioLevel();
+    } catch (err) {
+        console.error("Microphone access failed:", err);
+    }
+}
+
+async function startRecording() {
+    if (!mediaStream) return;
+
+    recorder = new MediaRecorder(mediaStream);
+    const chunks = [];
+
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        await transcribeAndSend(blob);
     };
 
-    if (window.__st_nativeCancel) {
-      ss.cancel = function () {
-        const r = window.__st_nativeCancel();
-        if (handsfreeEnabled) {
-          ttsCount = 0;
-          clearTimers();
-          scheduleGapCheck();
+    recorder.start();
+    // Stop recording after ~8 seconds max or when silence is detected (we'll improve this later)
+    setTimeout(() => {
+        if (recorder && recorder.state === "recording") recorder.stop();
+    }, 8000);
+}
+
+function stopListening() {
+    isListening = false;
+    if (recorder && recorder.state === "recording") recorder.stop();
+    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
+    audioContext = null;
+    recorder = null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Send audio to OpenRouter Whisper → get text → send as user message
+// ─────────────────────────────────────────────────────────────
+async function transcribeAndSend(audioBlob) {
+    if (!settings.api_key) {
+        console.error("No API key set for Hands-Free Voice");
+        stopListening();
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", audioBlob, "recording.webm");
+    formData.append("model", settings.model);
+
+    try {
+        const response = await fetch(`${settings.endpoint}/audio/transcriptions`, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${settings.api_key}`
+            },
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (result.text && result.text.trim()) {
+            const userText = result.text.trim();
+            console.log("📝 Transcription:", userText);
+
+            // Send as user message
+            const context = SillyTavern.getContext();
+            await context.sendUserMessage(userText);   // This is the clean way in 1.17+
+        } else {
+            console.log("No speech recognized");
         }
-        return r;
-      };
+    } catch (err) {
+        console.error("Whisper transcription failed:", err);
     }
-  }
 
-  // ---- Boot ----
-  installTtsHook();
+    stopListening();
+}
 
-  const boot = setInterval(() => {
-    if (micBtn()) {
-      clearInterval(boot);
-      ensureToggleButton();
-      installHotkey();
-      installMicObserver();
-      updateToggleUI();
-      if (DEBUG) log("Hands-free voice sequencing ready", { handsfreeEnabled });
-    }
-  }, 200);
-})();
+// Auto-continue (next character message)
+async function autoContinue() {
+    const context = SillyTavern.getContext();
+    // This triggers the same behaviour as the "Continue" button / /continue slash command
+    await context.generate('continue');
+}
+
+console.log("Hands-Free Voice module loaded");
