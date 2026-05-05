@@ -1,4 +1,4 @@
-import { eventSource, event_types } from '../../../../script.js';
+import { eventSource, event_types, sendMessageAsUser } from '../../../../script.js';
 
 const MODULE_NAME = "HandsFreeVoice";
 
@@ -94,7 +94,7 @@ function getEffectiveEndpoint() {
 // ─────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────
-console.log("🚀 Hands-Free Voice v2.5 loaded");
+console.log("🚀 Hands-Free Voice v2.6 loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -125,7 +125,7 @@ jQuery(() => {
 
         hookAudioElement();
 
-        console.log("🎤 Hands-Free Voice v2.5 ready");
+        console.log("🎤 Hands-Free Voice v2.6 ready");
     });
 });
 
@@ -369,8 +369,7 @@ async function transcribeAndSend(audioBlob) {
         const transcribed = (data.text || data.transcript || '').trim();
         if (transcribed) {
             console.log("📝 Whisper transcribed:", transcribed);
-            const context = SillyTavern.getContext();
-            await context.sendUserMessage(transcribed);
+            await sendMessageAsUser(transcribed);
         } else {
             console.log("🔇 No speech recognized in audio");
         }
