@@ -29,12 +29,18 @@ const defaultSettings = Object.freeze({
     api_key: "",
     model: "openai/whisper-large-v3-turbo",
     custom_endpoint: "",
-    delay: 5
+    // Timing
+    delay: 5,           // seconds of initial silence before auto-continue
+    speech_pause: 1.5,  // seconds of in-speech silence before recording cutoff
+    max_recording: 120, // seconds maximum recording length (safety cap)
+    // Formatting
+    quote_speech: false // wrap transcribed text in quotation marks
 });
 
 let settings = {};
 let mediaStream = null;
 let audioContext = null;
+let analyserNode = null;
 let recorder = null;
 let silenceTimer = null;
 let isListening = false;
@@ -47,7 +53,6 @@ let ttsEndTimer = null;
 /**
  * Wait for ST's <audio id="tts_audio"> element to appear in the DOM,
  * then attach ended/play listeners so we know when speech truly stops.
- * ST appends this element to document.body during its TTS init.
  */
 function hookAudioElement() {
     const audio = document.getElementById('tts_audio');
@@ -56,7 +61,6 @@ function hookAudioElement() {
         return;
     }
 
-    // A new audio segment started — cancel any pending "all done" timer
     audio.addEventListener('play', () => {
         if (ttsEndTimer) {
             clearTimeout(ttsEndTimer);
@@ -64,8 +68,6 @@ function hookAudioElement() {
         }
     });
 
-    // An audio segment ended — start debounce timer.
-    // If no new segment starts within 500 ms, TTS is truly done.
     audio.addEventListener('ended', () => {
         if (ttsEndTimer) clearTimeout(ttsEndTimer);
         ttsEndTimer = setTimeout(() => {
@@ -91,10 +93,17 @@ function getEffectiveEndpoint() {
         : provider.endpoint;
 }
 
+function getCurrentVolume() {
+    if (!analyserNode) return 0;
+    const data = new Uint8Array(analyserNode.frequencyBinCount);
+    analyserNode.getByteFrequencyData(data);
+    return data.reduce((a, b) => a + b, 0) / data.length;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────
-console.log("🚀 Hands-Free Voice v2.6 loaded");
+console.log("🚀 Hands-Free Voice v2.7 loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -125,7 +134,7 @@ jQuery(() => {
 
         hookAudioElement();
 
-        console.log("🎤 Hands-Free Voice v2.6 ready");
+        console.log("🎤 Hands-Free Voice v2.7 ready");
     });
 });
 
@@ -147,6 +156,9 @@ function addSettingsPanel() {
             <div class="inline-drawer-content">
                 <label><input type="checkbox" id="hf_enabled"> Enable Hands-Free Mode</label>
 
+                <hr>
+                <b>API Settings</b>
+
                 <label>API Provider</label>
                 <select id="hf_provider" class="text_pole">
                     ${providerOptions}
@@ -163,9 +175,26 @@ function addSettingsPanel() {
                     <input type="text" id="hf_custom_endpoint" class="text_pole" placeholder="http://localhost:8080/v1">
                 </div>
 
-                <label>Silence timeout (seconds)</label>
-                <input type="number" id="hf_delay" class="text_pole" value="5" min="1" max="30">
-                <small>If you don't speak within this time, the character will continue automatically.</small>
+                <hr>
+                <b>Timing</b>
+
+                <label>Silence Timeout (seconds)</label>
+                <input type="number" id="hf_delay" class="text_pole" min="1" max="60">
+                <small>After TTS ends, how long to wait for you to start speaking before the character auto-continues.</small>
+
+                <label>Speech Pause Tolerance (seconds)</label>
+                <input type="number" id="hf_speech_pause" class="text_pole" min="0.1" max="10" step="0.1">
+                <small>How long a pause mid-speech before recording stops and is sent for transcription. Allows natural pauses.</small>
+
+                <label>Max Recording Length (seconds)</label>
+                <input type="number" id="hf_max_recording" class="text_pole" min="5" max="600">
+                <small>Safety cap on recording length. Prevents the mic running indefinitely if you step away.</small>
+
+                <hr>
+                <b>Formatting</b>
+
+                <label><input type="checkbox" id="hf_quote_speech"> Wrap speech in quotation marks</label>
+                <small>When enabled, transcribed text is sent as "text" instead of plain text.</small>
             </div>
         </div>
     </div>`;
@@ -186,7 +215,6 @@ function bindSettingsUI() {
         settings.provider = this.value;
         const provider = PROVIDERS[settings.provider];
         if (provider) {
-            // Auto-fill default model when provider changes
             settings.model = provider.defaultModel;
             $('#hf_model').val(settings.model);
         }
@@ -210,7 +238,22 @@ function bindSettingsUI() {
     });
 
     $('#hf_delay').val(settings.delay).on('input', function () {
-        settings.delay = parseFloat(this.value) || 5;
+        settings.delay = parseFloat(this.value) || defaultSettings.delay;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_speech_pause').val(settings.speech_pause).on('input', function () {
+        settings.speech_pause = parseFloat(this.value) || defaultSettings.speech_pause;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_max_recording').val(settings.max_recording).on('input', function () {
+        settings.max_recording = parseFloat(this.value) || defaultSettings.max_recording;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_quote_speech').prop('checked', settings.quote_speech).on('change', function () {
+        settings.quote_speech = this.checked;
         context.saveSettingsDebounced();
     });
 
@@ -218,8 +261,7 @@ function bindSettingsUI() {
 }
 
 function updateCustomEndpointVisibility() {
-    const isLocal = settings.provider === 'local';
-    $('#hf_custom_endpoint_row').toggle(isLocal);
+    $('#hf_custom_endpoint_row').toggle(settings.provider === 'local');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -228,6 +270,7 @@ function updateCustomEndpointVisibility() {
 async function onTTSPlaybackEnded() {
     await startVoiceDetection();
 
+    // Start silence timeout — if user never speaks, auto-continue
     if (silenceTimer) clearTimeout(silenceTimer);
     silenceTimer = setTimeout(() => {
         if (!isListening) return;
@@ -243,18 +286,16 @@ async function startVoiceDetection() {
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
         const source = audioContext.createMediaStreamSource(mediaStream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512;
-        source.connect(analyser);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyserNode = audioContext.createAnalyser();
+        analyserNode.fftSize = 512;
+        source.connect(analyserNode);
 
         isListening = true;
         let speechDetected = false;
 
         const checkLevel = () => {
             if (!isListening) return;
-            analyser.getByteFrequencyData(dataArray);
-            const volume = dataArray.reduce((a, b) => a + b) / dataArray.length;
+            const volume = getCurrentVolume();
             if (volume > 25 && !speechDetected) {
                 speechDetected = true;
                 console.log("🗣️ Speech detected – recording");
@@ -281,9 +322,42 @@ async function startRecording() {
     };
 
     recorder.start();
-    setTimeout(() => {
-        if (recorder && recorder.state === "recording") recorder.stop();
-    }, 8000);
+
+    const speechPauseMs = (settings.speech_pause || defaultSettings.speech_pause) * 1000;
+    const maxRecordingMs = (settings.max_recording || defaultSettings.max_recording) * 1000;
+    const pollIntervalMs = 100;
+
+    let silentFor = 0;
+    const startTime = Date.now();
+
+    // Poll for in-speech silence and max-length cutoff
+    const silencePoller = setInterval(() => {
+        if (!recorder || recorder.state !== "recording") {
+            clearInterval(silencePoller);
+            return;
+        }
+
+        // Safety cap: max recording length
+        if (Date.now() - startTime >= maxRecordingMs) {
+            console.log(`⏱️ Max recording length (${settings.max_recording}s) reached – stopping`);
+            clearInterval(silencePoller);
+            recorder.stop();
+            return;
+        }
+
+        // Check for post-speech silence
+        const volume = getCurrentVolume();
+        if (volume <= 25) {
+            silentFor += pollIntervalMs;
+            if (silentFor >= speechPauseMs) {
+                console.log(`🤫 Speech pause (${settings.speech_pause}s) reached – stopping recording`);
+                clearInterval(silencePoller);
+                recorder.stop();
+            }
+        } else {
+            silentFor = 0; // reset on any sound
+        }
+    }, pollIntervalMs);
 }
 
 function stopListening() {
@@ -292,6 +366,7 @@ function stopListening() {
     if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
     mediaStream = null;
     audioContext = null;
+    analyserNode = null;
     recorder = null;
 }
 
@@ -319,7 +394,6 @@ async function transcribeAndSend(audioBlob) {
             // ── OpenRouter: JSON body with base64-encoded audio ──────────────
             const arrayBuffer = await audioBlob.arrayBuffer();
             const bytes = new Uint8Array(arrayBuffer);
-            // btoa with large arrays needs chunked approach to avoid stack overflow
             let binary = '';
             const chunkSize = 8192;
             for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -327,7 +401,6 @@ async function transcribeAndSend(audioBlob) {
             }
             const base64 = btoa(binary);
 
-            // Derive format from MIME type
             const mimeType = audioBlob.type || 'audio/webm';
             const format = mimeType.includes('ogg')  ? 'ogg'
                          : mimeType.includes('mp4')  ? 'mp4'
@@ -366,10 +439,16 @@ async function transcribeAndSend(audioBlob) {
         }
 
         const data = await res.json();
-        const transcribed = (data.text || data.transcript || '').trim();
+        let transcribed = (data.text || data.transcript || '').trim();
+
         if (transcribed) {
+            if (settings.quote_speech) {
+                transcribed = `"${transcribed}"`;
+            }
             console.log("📝 Whisper transcribed:", transcribed);
             await sendMessageAsUser(transcribed);
+            // Trigger character response
+            await SillyTavern.getContext().generate('normal');
         } else {
             console.log("🔇 No speech recognized in audio");
         }
