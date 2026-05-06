@@ -103,7 +103,7 @@ function getCurrentVolume() {
 // ─────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────
-console.log("🚀 Hands-Free Voice v2.7 loaded");
+console.log("🚀 Hands-Free Voice v2.8 loaded");
 
 jQuery(() => {
     eventSource.on(event_types.APP_READY, () => {
@@ -134,7 +134,7 @@ jQuery(() => {
 
         hookAudioElement();
 
-        console.log("🎤 Hands-Free Voice v2.7 ready");
+        console.log("🎤 Hands-Free Voice v2.8 ready");
     });
 });
 
@@ -461,5 +461,5 @@ async function transcribeAndSend(audioBlob) {
 
 async function autoContinue() {
     const context = SillyTavern.getContext();
-    await context.generate('continue');
+    await context.generate('normal');
 }
