@@ -1,9 +1,10 @@
 {
-    "name": "Mic Toggle (TTS/STT)",
-    "display_name": "Mic Toggle (TTS/STT)",
-    "description": "Toggles microphone off during TTS playback.",
-    "version": "1.0.0",
-    "author": "Andy Glenn",
-    "entrypoint": "index.js",
-    "js": ["index.js"]
+    "display_name": "Hands-Free Voice",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "Flaxify",
+    "version": "2.8.0",
+    "homePage": "https://github.com/Flaxify/ST-Hands-Free-Voice"
 }

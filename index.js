@@ -1,315 +1,465 @@
-(() => {
-  const MIC_SELECTOR = "#microphone_button";
+import { eventSource, event_types, sendMessageAsUser } from '../../../../script.js';
 
-  // ---- Feature Toggle (persisted, OFF by default) ----
-  const EXT_KEY = "handsfree_seq_enabled";
+const MODULE_NAME = "HandsFreeVoice";
 
-  // ⬇️ DEFAULT = false if not yet set
-  let handsfreeEnabled = (localStorage.getItem(EXT_KEY) ?? "false") === "true";
-
-  function setHandsfreeEnabled(v) {
-    handsfreeEnabled = !!v;
-    localStorage.setItem(EXT_KEY, handsfreeEnabled ? "true" : "false");
-
-    if (!handsfreeEnabled) {
-      try { clearTimers(); } catch {}
-      try { stopVad(); } catch {}
+const PROVIDERS = {
+    openrouter: {
+        label: "OpenRouter",
+        endpoint: "https://openrouter.ai/api/v1",
+        defaultModel: "openai/whisper-large-v3-turbo",
+        format: "json_base64"
+    },
+    groq: {
+        label: "Groq",
+        endpoint: "https://api.groq.com/openai/v1",
+        defaultModel: "whisper-large-v3-turbo",
+        format: "multipart"
+    },
+    local: {
+        label: "Local / Custom",
+        endpoint: "",
+        defaultModel: "whisper-1",
+        format: "multipart"
     }
+};
 
-    updateToggleUI();
-  }
+const defaultSettings = Object.freeze({
+    enabled: false,
+    provider: "openrouter",
+    api_key: "",
+    model: "openai/whisper-large-v3-turbo",
+    custom_endpoint: "",
+    // Timing
+    delay: 5,           // seconds of initial silence before auto-continue
+    speech_pause: 1.5,  // seconds of in-speech silence before recording cutoff
+    max_recording: 120, // seconds maximum recording length (safety cap)
+    // Formatting
+    quote_speech: false // wrap transcribed text in quotation marks
+});
 
-  function toggleHandsfree() {
-    setHandsfreeEnabled(!handsfreeEnabled);
-  }
+let settings = {};
+let mediaStream = null;
+let audioContext = null;
+let analyserNode = null;
+let recorder = null;
+let silenceTimer = null;
+let isListening = false;
 
-  // ---- Tunables ----
-  const RESUME_COOLDOWN_MS = 300;
-  const TTS_GAP_GRACE_MS = 2000;
-  const CLICK_VERIFY_MS = 120;
-  const MAX_RETRIES = 4;
+// ─────────────────────────────────────────────────────────────
+// TTS playback-end detection via ST's #tts_audio element
+// ─────────────────────────────────────────────────────────────
+let ttsEndTimer = null;
 
-  // VAD / silence endpointing
-  const LEVEL_THRESHOLD = 0.028;
-  const MIN_SPEECH_MS = 350;
-  const SILENCE_MS_TO_STOP = 1100;
-  const POLL_MS = 50;
-
-  const DEBUG = true;
-  const log = (...a) => DEBUG && console.log("[SEQ]", ...a);
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-  // ---- Mic state ----
-  function micBtn() {
-    return document.querySelector(MIC_SELECTOR);
-  }
-
-  function micIsRecording(btn) {
-    if (!btn) return false;
-
-    const cls = (btn.className || "").toLowerCase();
-    if (cls.includes("fa-microphone-slash")) return true;
-    if (cls.includes("fa-microphone") && !cls.includes("fa-microphone-slash")) return false;
-
-    const title = (btn.getAttribute("title") || "").toLowerCase();
-    if (title.includes("end and transcribe")) return true;
-    if (title.includes("click to speak")) return false;
-
-    return false;
-  }
-
-  async function enforceMic(shouldRecord) {
-    if (!handsfreeEnabled) return false;
-
-    const btn = micBtn();
-    if (!btn) return false;
-
-    for (let i = 1; i <= MAX_RETRIES; i++) {
-      if (micIsRecording(btn) === shouldRecord) return true;
-      btn.click();
-      await sleep(CLICK_VERIFY_MS);
-    }
-    return false;
-  }
-
-  // ---- UI Toggle Button ----
-  function ensureToggleButton() {
-    if (document.querySelector("#handsfree_toggle_btn")) return;
-
-    const mic = micBtn();
-    if (!mic) return;
-
-    const btn = document.createElement("button");
-    btn.id = "handsfree_toggle_btn";
-    btn.type = "button";
-    btn.title = "Toggle hands-free voice sequencing";
-    btn.style.marginLeft = "8px";
-    btn.style.padding = "2px 8px";
-    btn.style.borderRadius = "8px";
-    btn.style.border = "1px solid var(--SmartThemeBorderColor, #666)";
-    btn.style.background = "var(--SmartThemeBodyColor, transparent)";
-    btn.style.cursor = "pointer";
-    btn.style.fontSize = "12px";
-    btn.style.lineHeight = "18px";
-    btn.style.userSelect = "none";
-
-    btn.addEventListener("click", toggleHandsfree);
-
-    mic.parentElement?.appendChild(btn);
-    updateToggleUI();
-  }
-
-  function updateToggleUI() {
-    const btn = document.querySelector("#handsfree_toggle_btn");
-    if (!btn) return;
-
-    btn.textContent = handsfreeEnabled ? "HF:ON" : "HF:OFF";
-    btn.style.opacity = handsfreeEnabled ? "1" : "0.55";
-  }
-
-  // Optional hotkey: Ctrl+Shift+H
-  function installHotkey() {
-    if (window.__handsfree_hotkey_installed) return;
-    window.__handsfree_hotkey_installed = true;
-
-    window.addEventListener("keydown", (e) => {
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyH") {
-        toggleHandsfree();
-        e.preventDefault();
-      }
-    });
-  }
-
-  // ---- TTS sequencing ----
-  let ttsCount = 0;
-  let resumeTimer = null;
-  let gapTimer = null;
-
-  function clearTimers() {
-    if (resumeTimer) clearTimeout(resumeTimer);
-    if (gapTimer) clearTimeout(gapTimer);
-    resumeTimer = null;
-    gapTimer = null;
-  }
-
-  function ttsStart() {
-    if (!handsfreeEnabled) return;
-
-    ttsCount++;
-    clearTimers();
-    enforceMic(false);
-  }
-
-  function scheduleGapCheck() {
-    if (!handsfreeEnabled) return;
-
-    if (gapTimer) clearTimeout(gapTimer);
-
-    gapTimer = setTimeout(() => {
-      gapTimer = null;
-
-      if (ttsCount === 0) {
-        resumeTimer = setTimeout(() => {
-          if (handsfreeEnabled && ttsCount === 0) {
-            enforceMic(true);
-          }
-        }, RESUME_COOLDOWN_MS);
-      }
-    }, TTS_GAP_GRACE_MS);
-  }
-
-  function ttsEnd() {
-    if (!handsfreeEnabled) return;
-
-    ttsCount = Math.max(0, ttsCount - 1);
-    if (ttsCount === 0) scheduleGapCheck();
-  }
-
-  // ---- VAD endpointing ----
-  let audioCtx = null, analyser = null, source = null, stream = null, pollTimer = null;
-  let speechStartedAt = 0, lastLoudAt = 0;
-
-  function rms() {
-    const buf = new Uint8Array(analyser.fftSize);
-    analyser.getByteTimeDomainData(buf);
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const v = (buf[i] - 128) / 128;
-      sum += v * v;
-    }
-    return Math.sqrt(sum / buf.length);
-  }
-
-  async function ensureVadRunning() {
-    if (!handsfreeEnabled || pollTimer) return;
-
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 1024;
-
-    source = audioCtx.createMediaStreamSource(stream);
-    source.connect(analyser);
-
-    speechStartedAt = 0;
-    lastLoudAt = performance.now();
-
-    pollTimer = setInterval(() => {
-      if (!handsfreeEnabled) return;
-
-      const btn = micBtn();
-      if (!btn || !micIsRecording(btn)) return;
-      if (ttsCount > 0 || gapTimer) return;
-
-      const level = rms();
-      const now = performance.now();
-
-      if (level >= LEVEL_THRESHOLD) {
-        if (!speechStartedAt) speechStartedAt = now;
-        lastLoudAt = now;
-      }
-
-      if (
-        speechStartedAt &&
-        now - speechStartedAt >= MIN_SPEECH_MS &&
-        now - lastLoudAt >= SILENCE_MS_TO_STOP
-      ) {
-        btn.click();
-        speechStartedAt = 0;
-        lastLoudAt = performance.now();
-      }
-    }, POLL_MS);
-  }
-
-  function stopVad() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
-
-    try { source?.disconnect(); } catch {}
-    try { analyser?.disconnect?.(); } catch {}
-    try { audioCtx?.close?.(); } catch {}
-    try { stream?.getTracks()?.forEach(t => t.stop()); } catch {}
-
-    source = analyser = audioCtx = stream = null;
-  }
-
-  function installMicObserver() {
-    const btn = micBtn();
-    if (!btn) return;
-
-    const obs = new MutationObserver(() => {
-      if (!handsfreeEnabled) {
-        stopVad();
+/**
+ * Wait for ST's <audio id="tts_audio"> element to appear in the DOM,
+ * then attach ended/play listeners so we know when speech truly stops.
+ */
+function hookAudioElement() {
+    const audio = document.getElementById('tts_audio');
+    if (!audio) {
+        setTimeout(hookAudioElement, 500);
         return;
-      }
-      micIsRecording(btn) ? ensureVadRunning().catch(() => {}) : stopVad();
-    });
-
-    obs.observe(btn, { attributes: true, attributeFilter: ["class", "title", "aria-label"] });
-
-    if (handsfreeEnabled && micIsRecording(btn)) ensureVadRunning().catch(() => {});
-  }
-
-  // ---- Native-safe TTS hook ----
-  function installTtsHook() {
-    const ss = window.speechSynthesis;
-    if (!ss?.speak) return;
-
-    if (!window.__st_nativeSpeak) {
-      window.__st_nativeSpeak = ss.speak.bind(ss);
-      window.__st_nativeCancel = ss.cancel?.bind(ss);
     }
 
-    if (window.__st_seq_installed_final) return;
-    window.__st_seq_installed_final = true;
+    audio.addEventListener('play', () => {
+        if (ttsEndTimer) {
+            clearTimeout(ttsEndTimer);
+            ttsEndTimer = null;
+        }
+    });
 
-    ss.speak = function (utterance) {
-      if (handsfreeEnabled) ttsStart();
+    audio.addEventListener('ended', () => {
+        if (ttsEndTimer) clearTimeout(ttsEndTimer);
+        ttsEndTimer = setTimeout(() => {
+            ttsEndTimer = null;
+            if (settings.enabled && !isListening) {
+                console.log("🎤 TTS playback fully ended – starting hands-free listening");
+                onTTSPlaybackEnded();
+            }
+        }, 500);
+    });
 
-      try {
-        const pe = utterance.onend;
-        const pr = utterance.onerror;
+    console.log("🔊 Hands-Free Voice: hooked into #tts_audio element");
+}
 
-        utterance.onend = e => {
-          if (handsfreeEnabled) ttsEnd();
-          pe?.call(utterance, e);
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+function getEffectiveEndpoint() {
+    const provider = PROVIDERS[settings.provider];
+    if (!provider) return settings.custom_endpoint || '';
+    return settings.provider === 'local'
+        ? (settings.custom_endpoint || '').replace(/\/$/, '')
+        : provider.endpoint;
+}
+
+function getCurrentVolume() {
+    if (!analyserNode) return 0;
+    const data = new Uint8Array(analyserNode.frequencyBinCount);
+    analyserNode.getByteFrequencyData(data);
+    return data.reduce((a, b) => a + b, 0) / data.length;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────
+console.log("🚀 Hands-Free Voice v2.8 loaded");
+
+jQuery(() => {
+    eventSource.on(event_types.APP_READY, () => {
+        console.log("✅ Hands-Free Voice: APP_READY → initializing");
+
+        const context = SillyTavern.getContext();
+
+        if (!context.extensionSettings[MODULE_NAME]) {
+            context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
+        }
+        settings = context.extensionSettings[MODULE_NAME];
+
+        // Migrate old "endpoint" field → provider
+        if (settings.endpoint !== undefined && settings.provider === undefined) {
+            const ep = settings.endpoint || '';
+            if (ep.includes('openrouter.ai')) settings.provider = 'openrouter';
+            else if (ep.includes('groq.com'))  settings.provider = 'groq';
+            else { settings.provider = 'local'; settings.custom_endpoint = ep; }
+            delete settings.endpoint;
+        }
+
+        Object.keys(defaultSettings).forEach(key => {
+            if (settings[key] === undefined) settings[key] = defaultSettings[key];
+        });
+
+        addSettingsPanel();
+        console.log("✅ Settings panel added");
+
+        hookAudioElement();
+
+        console.log("🎤 Hands-Free Voice v2.8 ready");
+    });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Settings UI
+// ─────────────────────────────────────────────────────────────
+function addSettingsPanel() {
+    const providerOptions = Object.entries(PROVIDERS)
+        .map(([key, p]) => `<option value="${key}">${p.label}</option>`)
+        .join('');
+
+    const html = `
+    <div class="handsfree-settings">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>Hands-Free Voice</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <label><input type="checkbox" id="hf_enabled"> Enable Hands-Free Mode</label>
+
+                <hr>
+                <b>API Settings</b>
+
+                <label>API Provider</label>
+                <select id="hf_provider" class="text_pole">
+                    ${providerOptions}
+                </select>
+
+                <label>API Key</label>
+                <input type="password" id="hf_api_key" class="text_pole" placeholder="sk-or-... / gsk_...">
+
+                <label>Whisper Model</label>
+                <input type="text" id="hf_model" class="text_pole" placeholder="openai/whisper-large-v3-turbo">
+
+                <div id="hf_custom_endpoint_row" style="display:none">
+                    <label>Custom Endpoint URL</label>
+                    <input type="text" id="hf_custom_endpoint" class="text_pole" placeholder="http://localhost:8080/v1">
+                </div>
+
+                <hr>
+                <b>Timing</b>
+
+                <label>Silence Timeout (seconds)</label>
+                <input type="number" id="hf_delay" class="text_pole" min="1" max="60">
+                <small>After TTS ends, how long to wait for you to start speaking before the character auto-continues.</small>
+
+                <label>Speech Pause Tolerance (seconds)</label>
+                <input type="number" id="hf_speech_pause" class="text_pole" min="0.1" max="10" step="0.1">
+                <small>How long a pause mid-speech before recording stops and is sent for transcription. Allows natural pauses.</small>
+
+                <label>Max Recording Length (seconds)</label>
+                <input type="number" id="hf_max_recording" class="text_pole" min="5" max="600">
+                <small>Safety cap on recording length. Prevents the mic running indefinitely if you step away.</small>
+
+                <hr>
+                <b>Formatting</b>
+
+                <label><input type="checkbox" id="hf_quote_speech"> Wrap speech in quotation marks</label>
+                <small>When enabled, transcribed text is sent as "text" instead of plain text.</small>
+            </div>
+        </div>
+    </div>`;
+
+    $('#extensions_settings2').append(html);
+    bindSettingsUI();
+}
+
+function bindSettingsUI() {
+    const context = SillyTavern.getContext();
+
+    $('#hf_enabled').prop('checked', settings.enabled).on('change', function () {
+        settings.enabled = this.checked;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_provider').val(settings.provider).on('change', function () {
+        settings.provider = this.value;
+        const provider = PROVIDERS[settings.provider];
+        if (provider) {
+            settings.model = provider.defaultModel;
+            $('#hf_model').val(settings.model);
+        }
+        updateCustomEndpointVisibility();
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_api_key').val(settings.api_key).on('input', function () {
+        settings.api_key = this.value.trim();
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_model').val(settings.model).on('input', function () {
+        settings.model = this.value.trim();
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_custom_endpoint').val(settings.custom_endpoint).on('input', function () {
+        settings.custom_endpoint = this.value.trim();
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_delay').val(settings.delay).on('input', function () {
+        settings.delay = parseFloat(this.value) || defaultSettings.delay;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_speech_pause').val(settings.speech_pause).on('input', function () {
+        settings.speech_pause = parseFloat(this.value) || defaultSettings.speech_pause;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_max_recording').val(settings.max_recording).on('input', function () {
+        settings.max_recording = parseFloat(this.value) || defaultSettings.max_recording;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_quote_speech').prop('checked', settings.quote_speech).on('change', function () {
+        settings.quote_speech = this.checked;
+        context.saveSettingsDebounced();
+    });
+
+    updateCustomEndpointVisibility();
+}
+
+function updateCustomEndpointVisibility() {
+    $('#hf_custom_endpoint_row').toggle(settings.provider === 'local');
+}
+
+// ─────────────────────────────────────────────────────────────
+// Core logic (TTS playback done → listen → transcribe → send)
+// ─────────────────────────────────────────────────────────────
+async function onTTSPlaybackEnded() {
+    await startVoiceDetection();
+
+    // Start silence timeout — if user never speaks, auto-continue
+    if (silenceTimer) clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+        if (!isListening) return;
+        console.log("⏰ No speech detected – auto-continuing");
+        autoContinue();
+        stopListening();
+    }, settings.delay * 1000);
+}
+
+async function startVoiceDetection() {
+    if (isListening) return;
+    try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        analyserNode = audioContext.createAnalyser();
+        analyserNode.fftSize = 512;
+        source.connect(analyserNode);
+
+        isListening = true;
+        let speechDetected = false;
+
+        const checkLevel = () => {
+            if (!isListening) return;
+            const volume = getCurrentVolume();
+            if (volume > 25 && !speechDetected) {
+                speechDetected = true;
+                console.log("🗣️ Speech detected – recording");
+                clearTimeout(silenceTimer);
+                startRecording();
+            }
+            requestAnimationFrame(checkLevel);
         };
-        utterance.onerror = e => {
-          if (handsfreeEnabled) ttsEnd();
-          pr?.call(utterance, e);
-        };
-      } catch {}
+        checkLevel();
+    } catch (err) {
+        console.error("❌ Mic access failed:", err);
+    }
+}
 
-      return window.__st_nativeSpeak(utterance);
+async function startRecording() {
+    if (!mediaStream) return;
+    recorder = new MediaRecorder(mediaStream);
+    const chunks = [];
+
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        await transcribeAndSend(blob);
     };
 
-    if (window.__st_nativeCancel) {
-      ss.cancel = function () {
-        const r = window.__st_nativeCancel();
-        if (handsfreeEnabled) {
-          ttsCount = 0;
-          clearTimers();
-          scheduleGapCheck();
+    recorder.start();
+
+    const speechPauseMs = (settings.speech_pause || defaultSettings.speech_pause) * 1000;
+    const maxRecordingMs = (settings.max_recording || defaultSettings.max_recording) * 1000;
+    const pollIntervalMs = 100;
+
+    let silentFor = 0;
+    const startTime = Date.now();
+
+    // Poll for in-speech silence and max-length cutoff
+    const silencePoller = setInterval(() => {
+        if (!recorder || recorder.state !== "recording") {
+            clearInterval(silencePoller);
+            return;
         }
-        return r;
-      };
-    }
-  }
 
-  // ---- Boot ----
-  installTtsHook();
+        // Safety cap: max recording length
+        if (Date.now() - startTime >= maxRecordingMs) {
+            console.log(`⏱️ Max recording length (${settings.max_recording}s) reached – stopping`);
+            clearInterval(silencePoller);
+            recorder.stop();
+            return;
+        }
 
-  const boot = setInterval(() => {
-    if (micBtn()) {
-      clearInterval(boot);
-      ensureToggleButton();
-      installHotkey();
-      installMicObserver();
-      updateToggleUI();
-      if (DEBUG) log("Hands-free voice sequencing ready", { handsfreeEnabled });
+        // Check for post-speech silence
+        const volume = getCurrentVolume();
+        if (volume <= 25) {
+            silentFor += pollIntervalMs;
+            if (silentFor >= speechPauseMs) {
+                console.log(`🤫 Speech pause (${settings.speech_pause}s) reached – stopping recording`);
+                clearInterval(silencePoller);
+                recorder.stop();
+            }
+        } else {
+            silentFor = 0; // reset on any sound
+        }
+    }, pollIntervalMs);
+}
+
+function stopListening() {
+    isListening = false;
+    if (recorder && recorder.state === "recording") recorder.stop();
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+    audioContext = null;
+    analyserNode = null;
+    recorder = null;
+}
+
+async function transcribeAndSend(audioBlob) {
+    if (!settings.api_key) {
+        console.error("❌ No API key set in Hands-Free Voice settings");
+        stopListening();
+        return;
     }
-  }, 200);
-})();
+
+    const endpoint = getEffectiveEndpoint();
+    if (!endpoint) {
+        console.error("❌ No endpoint configured. Set a custom endpoint URL in settings.");
+        stopListening();
+        return;
+    }
+
+    const providerFormat = PROVIDERS[settings.provider]?.format ?? 'multipart';
+
+    console.log(`🎙️ Transcribing via ${settings.provider} (${providerFormat}), blob: ${audioBlob.size} bytes`);
+
+    let res;
+    try {
+        if (providerFormat === 'json_base64') {
+            // ── OpenRouter: JSON body with base64-encoded audio ──────────────
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const bytes = new Uint8Array(arrayBuffer);
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            const base64 = btoa(binary);
+
+            const mimeType = audioBlob.type || 'audio/webm';
+            const format = mimeType.includes('ogg')  ? 'ogg'
+                         : mimeType.includes('mp4')  ? 'mp4'
+                         : mimeType.includes('wav')  ? 'wav'
+                         : 'webm';
+
+            res = await fetch(`${endpoint}/audio/transcriptions`, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${settings.api_key}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    input_audio: { data: base64, format },
+                    model: settings.model
+                })
+            });
+        } else {
+            // ── Groq / Local / OpenAI-compatible: multipart FormData ─────────
+            const formData = new FormData();
+            formData.append("file", audioBlob, "recording.webm");
+            formData.append("model", settings.model);
+
+            res = await fetch(`${endpoint}/audio/transcriptions`, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${settings.api_key}` },
+                body: formData
+            });
+        }
+
+        if (!res.ok) {
+            const errorBody = await res.text();
+            console.error(`❌ Whisper API error ${res.status}:`, errorBody);
+            stopListening();
+            return;
+        }
+
+        const data = await res.json();
+        let transcribed = (data.text || data.transcript || '').trim();
+
+        if (transcribed) {
+            if (settings.quote_speech) {
+                transcribed = `"${transcribed}"`;
+            }
+            console.log("📝 Whisper transcribed:", transcribed);
+            await sendMessageAsUser(transcribed);
+            // Trigger character response
+            await SillyTavern.getContext().generate('normal');
+        } else {
+            console.log("🔇 No speech recognized in audio");
+        }
+    } catch (err) {
+        console.error("❌ Whisper API error:", err);
+    }
+
+    stopListening();
+}
+
+async function autoContinue() {
+    const context = SillyTavern.getContext();
+    await context.generate('normal');
+}
