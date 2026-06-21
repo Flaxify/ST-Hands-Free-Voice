@@ -2,6 +2,7 @@ import { defaultSettings, VOLUME_THRESHOLD } from './constants.js';
 import { runtimeState } from './state.js';
 import { getSettings } from './settings.js';
 import { transcribeAndSend } from './transcription.js';
+import { renderHandsFreeControls } from './ui.js';
 
 function getVolumeThreshold() {
     return Number(getSettings().volume_threshold) || VOLUME_THRESHOLD;
@@ -34,6 +35,7 @@ export async function startVoiceDetection() {
         runtimeState.sourceNode.connect(runtimeState.analyserNode);
 
         runtimeState.isListening = true;
+        renderHandsFreeControls();
         let speechDetected = false;
 
         const checkLevel = () => {
@@ -49,6 +51,7 @@ export async function startVoiceDetection() {
                     runtimeState.silenceTimer = null;
                 }
                 startRecording();
+                renderHandsFreeControls();
                 return;
             }
             runtimeState.voiceDetectionFrame = requestAnimationFrame(checkLevel);
@@ -76,6 +79,7 @@ export async function startRecording() {
     };
 
     runtimeState.recorder.start();
+    renderHandsFreeControls();
 
     const settings = getSettings();
     const speechPauseMs = (settings.speech_pause || defaultSettings.speech_pause) * 1000;
@@ -161,6 +165,7 @@ async function releaseAudioResources() {
     runtimeState.sourceNode = null;
     runtimeState.audioContext = null;
     runtimeState.analyserNode = null;
+    renderHandsFreeControls();
 }
 
 export async function stopListening() {
@@ -188,4 +193,5 @@ export async function stopListening() {
     }
 
     runtimeState.recorder = null;
+    renderHandsFreeControls();
 }
