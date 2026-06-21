@@ -3,6 +3,10 @@ import { runtimeState } from './state.js';
 import { getSettings } from './settings.js';
 import { transcribeAndSend } from './transcription.js';
 
+function getVolumeThreshold() {
+    return Number(getSettings().volume_threshold) || VOLUME_THRESHOLD;
+}
+
 export function getCurrentVolume() {
     if (!runtimeState.analyserNode) return 0;
     const data = new Uint8Array(runtimeState.analyserNode.frequencyBinCount);
@@ -15,28 +19,44 @@ export async function startVoiceDetection() {
     try {
         runtimeState.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         runtimeState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const source = runtimeState.audioContext.createMediaStreamSource(runtimeState.mediaStream);
+
+        if (runtimeState.audioContext.state === 'suspended') {
+            try {
+                await runtimeState.audioContext.resume();
+            } catch (err) {
+                console.warn("⚠️ AudioContext resume failed:", err);
+            }
+        }
+
+        runtimeState.sourceNode = runtimeState.audioContext.createMediaStreamSource(runtimeState.mediaStream);
         runtimeState.analyserNode = runtimeState.audioContext.createAnalyser();
         runtimeState.analyserNode.fftSize = 512;
-        source.connect(runtimeState.analyserNode);
+        runtimeState.sourceNode.connect(runtimeState.analyserNode);
 
         runtimeState.isListening = true;
         let speechDetected = false;
 
         const checkLevel = () => {
-            if (!runtimeState.isListening) return;
+            runtimeState.voiceDetectionFrame = null;
+            if (!runtimeState.isListening || speechDetected) return;
             const volume = getCurrentVolume();
-            if (volume > VOLUME_THRESHOLD && !speechDetected) {
+            const threshold = getVolumeThreshold();
+            if (volume > threshold) {
                 speechDetected = true;
                 console.log("🗣️ Speech detected – recording");
-                clearTimeout(runtimeState.silenceTimer);
+                if (runtimeState.silenceTimer) {
+                    clearTimeout(runtimeState.silenceTimer);
+                    runtimeState.silenceTimer = null;
+                }
                 startRecording();
+                return;
             }
-            requestAnimationFrame(checkLevel);
+            runtimeState.voiceDetectionFrame = requestAnimationFrame(checkLevel);
         };
-        checkLevel();
+        runtimeState.voiceDetectionFrame = requestAnimationFrame(checkLevel);
     } catch (err) {
         console.error("❌ Mic access failed:", err);
+        await stopListening();
     }
 }
 
@@ -47,7 +67,11 @@ export async function startRecording() {
 
     runtimeState.recorder.ondataavailable = e => chunks.push(e.data);
     runtimeState.recorder.onstop = async () => {
+        runtimeState.isListening = false;
         const blob = new Blob(chunks, { type: 'audio/webm' });
+        runtimeState.recorder = null;
+        clearVolumePoller();
+        await releaseAudioResources();
         await transcribeAndSend(blob, stopListening);
     };
 
@@ -62,27 +86,28 @@ export async function startRecording() {
     const startTime = Date.now();
 
     // Poll for in-speech silence and max-length cutoff
-    const silencePoller = setInterval(() => {
+    clearVolumePoller();
+    runtimeState.volumePoller = setInterval(() => {
         if (!runtimeState.recorder || runtimeState.recorder.state !== "recording") {
-            clearInterval(silencePoller);
+            clearVolumePoller();
             return;
         }
 
         // Safety cap: max recording length
         if (Date.now() - startTime >= maxRecordingMs) {
             console.log(`⏱️ Max recording length (${getSettings().max_recording}s) reached – stopping`);
-            clearInterval(silencePoller);
+            clearVolumePoller();
             runtimeState.recorder.stop();
             return;
         }
 
         // Check for post-speech silence
         const volume = getCurrentVolume();
-        if (volume <= VOLUME_THRESHOLD) {
+        if (volume <= getVolumeThreshold()) {
             silentFor += pollIntervalMs;
             if (silentFor >= speechPauseMs) {
                 console.log(`🤫 Speech pause (${getSettings().speech_pause}s) reached – stopping recording`);
-                clearInterval(silencePoller);
+                clearVolumePoller();
                 runtimeState.recorder.stop();
             }
         } else {
@@ -91,12 +116,76 @@ export async function startRecording() {
     }, pollIntervalMs);
 }
 
-export function stopListening() {
-    runtimeState.isListening = false;
-    if (runtimeState.recorder && runtimeState.recorder.state === "recording") runtimeState.recorder.stop();
-    if (runtimeState.mediaStream) runtimeState.mediaStream.getTracks().forEach(t => t.stop());
+function clearSilenceTimer() {
+    if (!runtimeState.silenceTimer) return;
+    clearTimeout(runtimeState.silenceTimer);
+    runtimeState.silenceTimer = null;
+}
+
+function clearVolumePoller() {
+    if (!runtimeState.volumePoller) return;
+    clearInterval(runtimeState.volumePoller);
+    runtimeState.volumePoller = null;
+}
+
+function cancelVoiceDetectionFrame() {
+    if (!runtimeState.voiceDetectionFrame) return;
+    cancelAnimationFrame(runtimeState.voiceDetectionFrame);
+    runtimeState.voiceDetectionFrame = null;
+}
+
+async function releaseAudioResources() {
+    if (runtimeState.sourceNode) {
+        try {
+            runtimeState.sourceNode.disconnect();
+        } catch (err) {
+            // The node may already be disconnected during browser teardown.
+        }
+    }
+
+    if (runtimeState.mediaStream) {
+        runtimeState.mediaStream.getTracks().forEach(track => track.stop());
+    }
+
+    if (runtimeState.audioContext) {
+        try {
+            if (runtimeState.audioContext.state !== 'closed') {
+                await runtimeState.audioContext.close();
+            }
+        } catch (err) {
+            console.warn("⚠️ AudioContext close failed:", err);
+        }
+    }
+
     runtimeState.mediaStream = null;
+    runtimeState.sourceNode = null;
     runtimeState.audioContext = null;
     runtimeState.analyserNode = null;
+}
+
+export async function stopListening() {
+    if (runtimeState.isStopping) return;
+    runtimeState.isStopping = true;
+
+    try {
+        runtimeState.isListening = false;
+        clearSilenceTimer();
+        clearVolumePoller();
+        cancelVoiceDetectionFrame();
+
+        if (runtimeState.recorder && runtimeState.recorder.state === "recording") {
+            runtimeState.recorder.onstop = null;
+            try {
+                runtimeState.recorder.stop();
+            } catch (err) {
+                console.warn("⚠️ Recorder stop failed:", err);
+            }
+        }
+
+        await releaseAudioResources();
+    } finally {
+        runtimeState.isStopping = false;
+    }
+
     runtimeState.recorder = null;
 }

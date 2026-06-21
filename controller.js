@@ -7,8 +7,12 @@ export async function onTTSPlaybackEnded() {
     await startVoiceDetection();
 
     // Start silence timeout — if user never speaks, auto-continue
-    if (runtimeState.silenceTimer) clearTimeout(runtimeState.silenceTimer);
+    if (runtimeState.silenceTimer) {
+        clearTimeout(runtimeState.silenceTimer);
+        runtimeState.silenceTimer = null;
+    }
     runtimeState.silenceTimer = setTimeout(() => {
+        runtimeState.silenceTimer = null;
         if (!runtimeState.isListening) return;
         console.log("⏰ No speech detected – auto-continuing");
         autoContinue();
