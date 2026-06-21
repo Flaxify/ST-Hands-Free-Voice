@@ -5,6 +5,7 @@ import { getContext } from './sillytavern.js';
 
 const CHATBAR_BUTTON_CLASSES = [
     'fa-microphone',
+    'fa-microphone-lines',
     'fa-microphone-slash',
     'fa-spinner',
     'fa-spin',
@@ -179,13 +180,32 @@ function addChatbarMicButton() {
     $container.prepend($button);
 }
 
-function setHandsFreeEnabled(enabled) {
+async function setHandsFreeEnabled(enabled) {
     const context = getContext();
     const settings = getSettings();
 
     settings.enabled = !!enabled;
     context.saveSettingsDebounced();
     renderHandsFreeControls();
+
+    if (!settings.enabled) {
+        console.log("[Hands-Free Voice] Disabled");
+        return;
+    }
+
+    if (isTTSPlaybackActive()) {
+        console.log("[Hands-Free Voice] Enabled; waiting for current TTS playback to finish");
+        return;
+    }
+
+    if (runtimeState.isListening || runtimeState.recorder) {
+        console.log("[Hands-Free Voice] Enabled");
+        return;
+    }
+
+    console.log("[Hands-Free Voice] Enabled; starting listening because no TTS is active");
+    const { onTTSPlaybackEnded } = await import('./controller.js');
+    await onTTSPlaybackEnded();
 }
 
 export function renderHandsFreeControls() {
@@ -211,10 +231,20 @@ export function renderHandsFreeControls() {
         $button.prop('title', 'Hands-Free Voice is transcribing');
         $button.attr('aria-label', 'Hands-Free Voice is transcribing');
         $button.attr('aria-busy', 'true');
+    } else if (recording) {
+        $button.addClass('fa-microphone fa-microphone-lines');
+        $button.prop('title', 'Hands-Free Voice: Recording');
+        $button.attr('aria-label', 'Hands-Free Voice: Recording');
+        $button.attr('aria-busy', 'false');
+    } else if (active) {
+        $button.addClass('fa-microphone fa-microphone-lines');
+        $button.prop('title', 'Hands-Free Voice: Listening');
+        $button.attr('aria-label', 'Hands-Free Voice: Listening');
+        $button.attr('aria-busy', 'false');
     } else if (enabled) {
         $button.addClass('fa-microphone');
-        $button.prop('title', active ? 'Hands-Free Voice is listening' : 'Disable Hands-Free Voice');
-        $button.attr('aria-label', active ? 'Hands-Free Voice is listening' : 'Disable Hands-Free Voice');
+        $button.prop('title', 'Disable Hands-Free Voice');
+        $button.attr('aria-label', 'Disable Hands-Free Voice');
         $button.attr('aria-busy', 'false');
     } else {
         $button.addClass('fa-microphone-slash');
@@ -224,6 +254,11 @@ export function renderHandsFreeControls() {
     }
 
     $button.attr('aria-pressed', String(enabled));
+}
+
+function isTTSPlaybackActive() {
+    const audio = document.getElementById('tts_audio');
+    return !!(audio && !audio.paused && !audio.ended && audio.currentTime > 0);
 }
 
 function updateCustomEndpointVisibility() {
