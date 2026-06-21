@@ -3,24 +3,26 @@ import { runtimeState } from './state.js';
 import { getEffectiveEndpoint, getSettings } from './settings.js';
 import { getContext, sendMessageAsUser } from './sillytavern.js';
 import { renderHandsFreeControls } from './ui.js';
+import { reportSetupError } from './validation.js';
 
 export async function transcribeAndSend(audioBlob, stopListening) {
     const settings = getSettings();
+    const provider = PROVIDERS[settings.provider];
 
-    if (!settings.api_key) {
-        console.error("❌ No API key set in Hands-Free Voice settings");
+    if (settings.provider !== 'local' && !settings.api_key?.trim()) {
+        reportSetupError('API key missing for the selected speech-to-text provider. Add it in the extension settings.');
         stopListening();
         return;
     }
 
     const endpoint = getEffectiveEndpoint();
     if (!endpoint) {
-        console.error("❌ No endpoint configured. Set a custom endpoint URL in settings.");
+        reportSetupError('Local/custom speech-to-text endpoint is missing or invalid. Check the endpoint URL in the extension settings.');
         stopListening();
         return;
     }
 
-    const providerFormat = PROVIDERS[settings.provider]?.format ?? 'multipart';
+    const providerFormat = provider?.format ?? 'multipart';
 
     console.log(`🎙️ Transcribing via ${settings.provider} (${providerFormat}), blob: ${audioBlob.size} bytes`);
 
@@ -62,10 +64,13 @@ export async function transcribeAndSend(audioBlob, stopListening) {
             const formData = new FormData();
             formData.append("file", audioBlob, "recording.webm");
             formData.append("model", settings.model);
+            const headers = settings.api_key?.trim()
+                ? { "Authorization": `Bearer ${settings.api_key.trim()}` }
+                : {};
 
             res = await fetch(`${endpoint}/audio/transcriptions`, {
                 method: "POST",
-                headers: { "Authorization": `Bearer ${settings.api_key}` },
+                headers,
                 body: formData
             });
         }

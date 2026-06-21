@@ -2,6 +2,7 @@ import { PROVIDERS, UI_SELECTORS, defaultSettings } from './constants.js';
 import { runtimeState } from './state.js';
 import { getSettings } from './settings.js';
 import { getContext } from './sillytavern.js';
+import { validateSetupBeforeListening } from './validation.js';
 
 const CHATBAR_BUTTON_CLASSES = [
     'fa-microphone',
@@ -191,6 +192,13 @@ async function setHandsFreeEnabled(enabled) {
 
     if (!settings.enabled) {
         console.log("[Hands-Free Voice] Disabled");
+        return;
+    }
+
+    if (!validateSetupBeforeListening()) {
+        settings.enabled = false;
+        context.saveSettingsDebounced();
+        renderHandsFreeControls();
         return;
     }
 
