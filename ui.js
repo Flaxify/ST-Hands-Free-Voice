@@ -1,6 +1,20 @@
-import { PROVIDERS, defaultSettings } from './constants.js';
+import { PROVIDERS, UI_SELECTORS, defaultSettings } from './constants.js';
+import { runtimeState } from './state.js';
 import { getSettings } from './settings.js';
 import { getContext } from './sillytavern.js';
+
+const CHATBAR_BUTTON_CLASSES = [
+    'fa-microphone',
+    'fa-ear-listen',
+    'fa-assistive-listening-systems',
+    'fa-microphone-slash',
+    'fa-spinner',
+    'fa-spin',
+    'active',
+    'hf-enabled',
+    'hf-listening',
+    'hf-processing'
+];
 
 export function addSettingsPanel() {
     const providerOptions = Object.entries(PROVIDERS)
@@ -66,15 +80,16 @@ export function addSettingsPanel() {
 
     $('#extensions_settings2').append(html);
     bindSettingsUI();
+    addChatbarMicButton();
+    renderHandsFreeControls();
 }
 
 function bindSettingsUI() {
     const context = getContext();
     const settings = getSettings();
 
-    $('#hf_enabled').prop('checked', settings.enabled).on('change', function () {
-        settings.enabled = this.checked;
-        context.saveSettingsDebounced();
+    $(UI_SELECTORS.enabledToggle).prop('checked', settings.enabled).on('change', function () {
+        setHandsFreeEnabled(this.checked);
     });
 
     $('#hf_provider').val(settings.provider).on('change', function () {
@@ -129,6 +144,122 @@ function bindSettingsUI() {
     });
 
     updateCustomEndpointVisibility();
+}
+
+function addChatbarMicButton() {
+    if ($(UI_SELECTORS.chatbarButton).length) return;
+
+    const $container = $(UI_SELECTORS.primaryChatbarContainer).length
+        ? $(UI_SELECTORS.primaryChatbarContainer)
+        : $(UI_SELECTORS.fallbackChatbarContainer);
+
+    if (!$container.length) {
+        console.warn("⚠️ Hands-Free Voice: chatbar send controls not found");
+        return;
+    }
+
+    const $button = $('<div>', {
+        id: UI_SELECTORS.chatbarButton.slice(1),
+        class: 'fa-solid fa-microphone-slash interactable',
+        role: 'button',
+        tabindex: 0,
+        title: 'Enable Hands-Free Voice',
+        'aria-label': 'Enable Hands-Free Voice',
+        'aria-pressed': 'false'
+    });
+
+    $button.on('click', () => {
+        setHandsFreeEnabled(!getSettings().enabled);
+    });
+
+    $button.on('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        setHandsFreeEnabled(!getSettings().enabled);
+    });
+
+    $container.prepend($button);
+}
+
+async function setHandsFreeEnabled(enabled) {
+    const context = getContext();
+    const settings = getSettings();
+
+    settings.enabled = !!enabled;
+    context.saveSettingsDebounced();
+    renderHandsFreeControls();
+
+    if (!settings.enabled) {
+        console.log("[Hands-Free Voice] Disabled");
+        return;
+    }
+
+    if (isTTSPlaybackActive()) {
+        console.log("[Hands-Free Voice] Enabled; waiting for current TTS playback to finish");
+        return;
+    }
+
+    if (runtimeState.isListening || runtimeState.recorder) {
+        console.log("[Hands-Free Voice] Enabled");
+        return;
+    }
+
+    console.log("[Hands-Free Voice] Enabled; starting listening because no TTS is active");
+    const { onTTSPlaybackEnded } = await import('./controller.js');
+    await onTTSPlaybackEnded();
+}
+
+export function renderHandsFreeControls() {
+    const settings = getSettings();
+    const enabled = !!settings.enabled;
+    const recording = runtimeState.recorder?.state === 'recording';
+    const active = enabled && (runtimeState.isListening || recording);
+    const processing = !!runtimeState.isTranscribing;
+    const $button = $(UI_SELECTORS.chatbarButton);
+
+    $(UI_SELECTORS.enabledToggle).prop('checked', enabled);
+
+    if (!$button.length) return;
+
+    $button.removeClass(CHATBAR_BUTTON_CLASSES.join(' '));
+    $button.addClass('fa-solid interactable');
+    $button.toggleClass('hf-enabled', enabled);
+    $button.toggleClass('hf-listening active', active);
+    $button.toggleClass('hf-processing', processing);
+
+    if (processing) {
+        $button.addClass('fa-spinner fa-spin');
+        $button.prop('title', 'Hands-Free Voice is transcribing');
+        $button.attr('aria-label', 'Hands-Free Voice is transcribing');
+        $button.attr('aria-busy', 'true');
+    } else if (recording) {
+        $button.addClass('fa-microphone fa-assistive-listening-systems fa-ear-listen');
+        $button.prop('title', 'Hands-Free Voice: Recording');
+        $button.attr('aria-label', 'Hands-Free Voice: Recording');
+        $button.attr('aria-busy', 'false');
+    } else if (active) {
+        $button.addClass('fa-microphone fa-assistive-listening-systems fa-ear-listen');
+        $button.prop('title', 'Hands-Free Voice: Listening');
+        $button.attr('aria-label', 'Hands-Free Voice: Listening');
+        $button.attr('aria-busy', 'false');
+    } else if (enabled) {
+        $button.addClass('fa-microphone');
+        $button.prop('title', 'Disable Hands-Free Voice');
+        $button.attr('aria-label', 'Disable Hands-Free Voice');
+        $button.attr('aria-busy', 'false');
+    } else {
+        $button.addClass('fa-microphone-slash');
+        $button.prop('title', 'Enable Hands-Free Voice');
+        $button.attr('aria-label', 'Enable Hands-Free Voice');
+        $button.attr('aria-busy', 'false');
+    }
+
+    $button.attr('aria-pressed', String(enabled));
+}
+
+function isTTSPlaybackActive() {
+    const audio = document.getElementById('tts_audio');
+    return !!(audio && !audio.paused && !audio.ended && audio.currentTime > 0);
 }
 
 function updateCustomEndpointVisibility() {

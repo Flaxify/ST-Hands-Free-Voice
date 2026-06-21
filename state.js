@@ -9,5 +9,6 @@ export const runtimeState = {
     voiceDetectionFrame: null,
     isListening: false,
     isStopping: false,
+    isTranscribing: false,
     ttsEndTimer: null
 };

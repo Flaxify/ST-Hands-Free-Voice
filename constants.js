@@ -37,3 +37,10 @@ export const defaultSettings = Object.freeze({
 });
 
 export const VOLUME_THRESHOLD = 25;
+
+export const UI_SELECTORS = Object.freeze({
+    chatbarButton: '#handsfree_voice_button',
+    enabledToggle: '#hf_enabled',
+    primaryChatbarContainer: '#send_but_sheld',
+    fallbackChatbarContainer: '#rightSendForm'
+});

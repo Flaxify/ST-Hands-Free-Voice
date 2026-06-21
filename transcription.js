@@ -1,6 +1,8 @@
 import { PROVIDERS } from './constants.js';
+import { runtimeState } from './state.js';
 import { getEffectiveEndpoint, getSettings } from './settings.js';
 import { getContext, sendMessageAsUser } from './sillytavern.js';
+import { renderHandsFreeControls } from './ui.js';
 
 export async function transcribeAndSend(audioBlob, stopListening) {
     const settings = getSettings();
@@ -24,6 +26,9 @@ export async function transcribeAndSend(audioBlob, stopListening) {
 
     let res;
     try {
+        runtimeState.isTranscribing = true;
+        renderHandsFreeControls();
+
         if (providerFormat === 'json_base64') {
             // ── OpenRouter: JSON body with base64-encoded audio ──────────────
             const arrayBuffer = await audioBlob.arrayBuffer();
@@ -88,6 +93,9 @@ export async function transcribeAndSend(audioBlob, stopListening) {
         }
     } catch (err) {
         console.error("❌ Whisper API error:", err);
+    } finally {
+        runtimeState.isTranscribing = false;
+        renderHandsFreeControls();
     }
 
     stopListening();
