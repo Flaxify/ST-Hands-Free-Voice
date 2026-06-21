@@ -1,8 +1,10 @@
 import { defaultSettings, VOLUME_THRESHOLD } from './constants.js';
 import { runtimeState } from './state.js';
 import { getSettings } from './settings.js';
+import { getContext } from './sillytavern.js';
 import { transcribeAndSend } from './transcription.js';
 import { renderHandsFreeControls } from './ui.js';
+import { reportMicrophonePermissionError, validateSetupBeforeListening } from './validation.js';
 
 function getVolumeThreshold() {
     return Number(getSettings().volume_threshold) || VOLUME_THRESHOLD;
@@ -17,6 +19,15 @@ export function getCurrentVolume() {
 
 export async function startVoiceDetection() {
     if (runtimeState.isListening) return;
+    if (!validateSetupBeforeListening()) {
+        const settings = getSettings();
+        settings.enabled = false;
+        getContext().saveSettingsDebounced();
+        renderHandsFreeControls();
+        await stopListening();
+        return;
+    }
+
     try {
         runtimeState.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         runtimeState.audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -59,8 +70,17 @@ export async function startVoiceDetection() {
         runtimeState.voiceDetectionFrame = requestAnimationFrame(checkLevel);
     } catch (err) {
         console.error("❌ Mic access failed:", err);
+        if (isMicrophonePermissionError(err)) {
+            reportMicrophonePermissionError();
+        }
         await stopListening();
     }
+}
+
+function isMicrophonePermissionError(err) {
+    return err?.name === 'NotAllowedError'
+        || err?.name === 'PermissionDeniedError'
+        || err?.name === 'SecurityError';
 }
 
 export async function startRecording() {
