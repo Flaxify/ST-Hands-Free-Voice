@@ -181,7 +181,7 @@ function addChatbarMicButton() {
     $container.prepend($button);
 }
 
-async function setHandsFreeEnabled(enabled) {
+export async function setHandsFreeEnabled(enabled) {
     const context = getContext();
     const settings = getSettings();
 
@@ -191,6 +191,9 @@ async function setHandsFreeEnabled(enabled) {
 
     if (!settings.enabled) {
         console.log("[Hands-Free Voice] Disabled");
+        const { stopListening } = await import('./audio.js');
+        await stopListening();
+        renderHandsFreeControls();
         return;
     }
 
@@ -207,6 +210,23 @@ async function setHandsFreeEnabled(enabled) {
     console.log("[Hands-Free Voice] Enabled; starting listening because no TTS is active");
     const { onTTSPlaybackEnded } = await import('./controller.js');
     await onTTSPlaybackEnded();
+}
+
+export async function forceHandsFreeOff(reason = '') {
+    const context = getContext();
+    const settings = getSettings();
+    const wasEnabled = !!settings.enabled;
+
+    settings.enabled = false;
+    context.saveSettingsDebounced();
+
+    const { stopListening } = await import('./audio.js');
+    await stopListening();
+    renderHandsFreeControls();
+
+    if (wasEnabled && reason) {
+        console.log(`[Hands-Free Voice] Disabled; ${reason}`);
+    }
 }
 
 export function renderHandsFreeControls() {
