@@ -51,6 +51,10 @@ export function addSettingsPanel() {
                 <input type="number" id="hf_max_recording" class="text_pole" min="5" max="600">
                 <small>Safety cap on recording length. Prevents the mic running indefinitely if you step away.</small>
 
+                <label>Mic Sensitivity (volume threshold)</label>
+                <input type="number" id="hf_volume_threshold" class="text_pole" min="1" max="100">
+                <small>Lower values trigger on quieter sound. Default: 25.</small>
+
                 <hr>
                 <b>Formatting</b>
 
@@ -111,6 +115,11 @@ function bindSettingsUI() {
 
     $('#hf_max_recording').val(settings.max_recording).on('input', function () {
         settings.max_recording = parseFloat(this.value) || defaultSettings.max_recording;
+        context.saveSettingsDebounced();
+    });
+
+    $('#hf_volume_threshold').val(settings.volume_threshold).on('input', function () {
+        settings.volume_threshold = parseFloat(this.value) || defaultSettings.volume_threshold;
         context.saveSettingsDebounced();
     });
 

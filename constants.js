@@ -31,6 +31,7 @@ export const defaultSettings = Object.freeze({
     delay: 5,           // seconds of initial silence before auto-continue
     speech_pause: 1.5,  // seconds of in-speech silence before recording cutoff
     max_recording: 120, // seconds maximum recording length (safety cap)
+    volume_threshold: 25, // analyser volume required to detect speech
     // Formatting
     quote_speech: false // wrap transcribed text in quotation marks
 });
