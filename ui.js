@@ -5,7 +5,8 @@ import { getContext } from './sillytavern.js';
 
 const CHATBAR_BUTTON_CLASSES = [
     'fa-microphone',
-    'fa-microphone-lines',
+    'fa-ear-listen',
+    'fa-assistive-listening-systems',
     'fa-microphone-slash',
     'fa-spinner',
     'fa-spin',
@@ -232,12 +233,12 @@ export function renderHandsFreeControls() {
         $button.attr('aria-label', 'Hands-Free Voice is transcribing');
         $button.attr('aria-busy', 'true');
     } else if (recording) {
-        $button.addClass('fa-microphone fa-microphone-lines');
+        $button.addClass('fa-microphone fa-assistive-listening-systems fa-ear-listen');
         $button.prop('title', 'Hands-Free Voice: Recording');
         $button.attr('aria-label', 'Hands-Free Voice: Recording');
         $button.attr('aria-busy', 'false');
     } else if (active) {
-        $button.addClass('fa-microphone fa-microphone-lines');
+        $button.addClass('fa-microphone fa-assistive-listening-systems fa-ear-listen');
         $button.prop('title', 'Hands-Free Voice: Listening');
         $button.attr('aria-label', 'Hands-Free Voice: Listening');
         $button.attr('aria-busy', 'false');
